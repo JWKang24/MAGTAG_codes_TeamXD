@@ -1,23 +1,22 @@
-# code.py — MagTag ESP-NOW “Common Interests” (SEARCH/CHAT only)
+# code.py — MagTag ESP-NOW “Common Interests” (SEARCH/CHAT) + settings.toml
 #
-# Modes:
-#   - SEARCH (default)
-#     - D15 (Button A): enter CHAT (auto-picks closest peer by RSSI if not pre-selected)
-#     - D11 (Button D): toggle interests badge display (on/off)
-#   - CHAT
-#     - D15 (Button A): back to SEARCH
-#     - D14 (Button B): share contact (synced)
-#     - D11 (Button D): cycle to next common interest (synced on both devices)
+# SEARCH (default):
+#   - D15 (Button A): enter CHAT (auto-pick closest peer by RSSI if not pre-selected)
+#   - D11 (Button D): toggle interests badge display
 #
-# Notes:
-# - Uses ESP-NOW broadcast with a fixed channel for reliability.
-# - In CHAT mode, sync happens ONLY with the chosen chat peer AND only if peer targets us.
-# - Common-interest index sync uses a version counter + deterministic tie-break.
+# CHAT:
+#   - D15 (Button A): back to SEARCH
+#   - D14 (Button B): share contact (synced)
+#   - D11 (Button D): next common interest (synced on both devices)
+#
+# Config from /settings.toml via os.getenv():
+#   MY_NAME, MY_INTERESTS (comma-separated), BROADCAST_TOPIC, ESPNOW_CHANNEL
 
 import supervisor
 supervisor.runtime.autoreload = False
 
 import time
+import os
 import board
 import displayio
 import terminalio
@@ -28,31 +27,44 @@ import wifi
 from adafruit_display_text import label
 
 
-# =====================================================
-# EDIT THESE per MagTag
-# =====================================================
-MY_NAME = "MagTag-1"
-MY_INTERESTS = [
-    "python",
-    "music",
-    "hiking",
-    "gaming",
-    "cooking",
-    "sci-fi",
-    "cats",
-    "space",
-]
-# Optional: show a topic in SEARCH UI; not used for mode semantics
-BROADCAST_TOPIC = "circuitpython"
-# =====================================================
+# ---------------------------
+# Load settings.toml config
+# ---------------------------
+def _get_env_str(key, default=""):
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v)
 
-# ESP-NOW runs on a WiFi channel. All devices MUST match.
-ESPNOW_CHANNEL = 6
 
-BROADCAST_INTERVAL = 2.0       # seconds between broadcasts
-PEER_TIMEOUT = 15.0            # seconds before peer considered gone
-DISPLAY_REFRESH = 8.0          # minimum seconds between e-ink refreshes (avoid ghosting)
-MAX_MSG_LEN = 250              # ESP-NOW payload limit
+def _get_env_int(key, default):
+    v = os.getenv(key)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _parse_interests(csv_text):
+    if not csv_text:
+        return []
+    parts = [p.strip() for p in csv_text.split(",")]
+    return [p for p in parts if p][:12]
+
+
+MY_NAME = _get_env_str("MY_NAME", "MagTag")
+BROADCAST_TOPIC = _get_env_str("BROADCAST_TOPIC", "circuitpython")
+MY_INTERESTS = _parse_interests(_get_env_str("MY_INTERESTS", "python,circuitpython"))
+ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
+
+# Timing
+BROADCAST_INTERVAL = 2.0
+PEER_TIMEOUT = 15.0
+DISPLAY_REFRESH = 8.0
+MAX_MSG_LEN = 250
+
 
 # -- Modes (ONLY TWO) --
 MODE_SEARCH = 0
@@ -61,9 +73,10 @@ MODE_CHAT = 1
 MODE_NAMES = ["SEARCH", "CHAT"]
 MODE_DESCRIPTIONS = ["Searching for peers...", "Chatting"]
 MODE_COLORS = [
-    (0, 20, 0),    # SEARCH: dim green
-    (20, 15, 0),   # CHAT: dim amber
+    (0, 20, 0),    # SEARCH
+    (20, 15, 0),   # CHAT
 ]
+
 
 # -- Hardware --
 pixels = neopixel.NeoPixel(board.NEOPIXEL, 4, brightness=0.15)
@@ -88,7 +101,7 @@ def wait_release(btn_index):
 
 # -- ESP-NOW setup --
 wifi.radio.enabled = True
-# Channel “hack” to force channel on some CircuitPython builds
+# Channel “hack” to force channel on some CP builds
 wifi.radio.start_ap(" ", "", channel=ESPNOW_CHANNEL, max_connections=0)
 wifi.radio.stop_ap()
 
@@ -113,26 +126,15 @@ display_dirty = True
 nearby_peers = {}
 
 # Chat state
-chat_peer_mac = None       # MAC bytes of chosen peer
-chat_common = []           # list[str] common interests
-chat_common_idx = 0        # which common interest is displayed
-chat_idx_ver = 0           # version counter for common_idx updates
-contact_shared = False     # synced “contact shared” flag
-
+chat_peer_mac = None
+chat_common = []
+chat_common_idx = 0
+chat_idx_ver = 0
+contact_shared = False
 
 # -- Protocol --
-# Message format (ASCII, pipe-delimited, max 250 bytes):
-#   MODE|NAME|interest1,interest2,...|TOPIC|CHAT_PEER_MACHEX|CONTACT_SHARED|COMMON_IDX|IDX_VER
-#
-# - MODE: 0 SEARCH, 1 CHAT
-# - TOPIC: optional string for display in SEARCH UI (no semantics)
-# - CHAT_PEER_MACHEX: in CHAT, who I am targeting (hex, no colons). empty otherwise.
-# - CONTACT_SHARED: "1" if user pressed share contact in CHAT, else "0"
-# - COMMON_IDX, IDX_VER: for synced cycling of common interests
-
-
+# MODE|NAME|interest1,interest2,...|TOPIC|CHAT_PEER_MACHEX|CONTACT_SHARED|COMMON_IDX|IDX_VER
 def build_message():
-    # Always send interests so matching works. If you want privacy, blank them in SEARCH.
     interests_str = ",".join(MY_INTERESTS[:12])
     topic_str = BROADCAST_TOPIC[:30] if current_mode == MODE_SEARCH else ""
 
@@ -158,9 +160,7 @@ def build_message():
         ver_str,
     ]
     msg = "|".join(parts)
-    if len(msg) > MAX_MSG_LEN:
-        msg = msg[:MAX_MSG_LEN]
-    return msg
+    return msg[:MAX_MSG_LEN]
 
 
 def parse_message(data):
@@ -231,7 +231,6 @@ def receive_all():
     changed = False
     now = time.monotonic()
 
-    # Drain incoming packets
     while e:
         packet = e.read()
         if packet is None:
@@ -253,7 +252,7 @@ def receive_all():
             "topic": info["topic"],
             "rssi": packet.rssi,
             "last_seen": now,
-            "peer_mac": info["peer_mac"],               # who THEY are targeting in CHAT
+            "peer_mac": info["peer_mac"],          # who THEY target in CHAT
             "contact_shared": info["contact_shared"],
             "common_idx": info["common_idx"],
             "idx_ver": info["idx_ver"],
@@ -268,17 +267,17 @@ def receive_all():
                 old["name"] != info["name"]):
                 changed = True
 
-    # Prune stale peers
+    # prune stale
     stale = [k for k, v in nearby_peers.items() if now - v["last_seen"] > PEER_TIMEOUT]
     for k in stale:
         del nearby_peers[k]
         changed = True
 
-    # CHAT sync: only with our chosen peer, and only if they target us
+    # CHAT sync: only with chosen peer AND only if peer targets us
     if current_mode == MODE_CHAT and chat_peer_mac:
         peer = nearby_peers.get(chat_peer_mac)
         if peer and peer.get("peer_mac") == bytes(my_mac):
-            # Recompute common list if their interests changed
+            # recompute common list
             new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
             if new_common != chat_common:
                 chat_common = new_common
@@ -286,29 +285,22 @@ def receive_all():
                     chat_common_idx = 0
                 changed = True
 
-            # Versioned index sync
+            # versioned sync for index
             peer_ver = peer.get("idx_ver", 0)
             if peer_ver > chat_idx_ver:
                 chat_idx_ver = peer_ver
-                if chat_common:
-                    chat_common_idx = peer.get("common_idx", 0) % len(chat_common)
-                else:
-                    chat_common_idx = 0
+                chat_common_idx = (peer.get("common_idx", 0) % len(chat_common)) if chat_common else 0
                 changed = True
             elif peer_ver == chat_idx_ver:
-                # Tie-break to converge: smaller MAC "wins"
-                # If my_mac > chat_peer_mac, I adopt peer's idx.
+                # tie-break: smaller MAC wins
                 if bytes(my_mac) > chat_peer_mac:
                     peer_idx = peer.get("common_idx", 0)
-                    if chat_common:
-                        peer_idx = peer_idx % len(chat_common)
-                    else:
-                        peer_idx = 0
+                    peer_idx = (peer_idx % len(chat_common)) if chat_common else 0
                     if peer_idx != chat_common_idx:
                         chat_common_idx = peer_idx
                         changed = True
 
-            # Contact sharing sync: OR behavior
+            # contact sharing sync (OR)
             if peer.get("contact_shared") and not contact_shared:
                 contact_shared = True
                 changed = True
@@ -316,8 +308,6 @@ def receive_all():
     if changed:
         display_dirty = True
 
-
-# -- Peer selection --
 def pick_closest_peer():
     best_mac = None
     best_rssi = -999
@@ -345,7 +335,6 @@ def update_leds(phase):
     pixels.show()
 
 
-# -- Display helpers --
 def rssi_bar(rssi):
     if rssi > -50:
         return "***"
@@ -354,14 +343,16 @@ def rssi_bar(rssi):
     return "*"
 
 
-# -- Display --
+# -- Display (uses your working refresh pattern) --
 def render_display():
     global last_display_refresh, display_dirty
 
-    display = board.DISPLAY
+    epd = board.DISPLAY
+    epd.rotation = 270
+
     g = displayio.Group()
 
-    # White background
+    # background
     bg = displayio.Bitmap(296, 128, 1)
     pal = displayio.Palette(1)
     pal[0] = 0xFFFFFF
@@ -373,11 +364,11 @@ def render_display():
     gray_pal = displayio.Palette(1)
     gray_pal[0] = 0x999999
 
-    # Top bar divider
+    # divider
     bar = displayio.Bitmap(296, 3, 1)
     g.append(displayio.TileGrid(bar, pixel_shader=black_pal, x=0, y=24))
 
-    # Mode indicator
+    # mode box
     mode_bg = displayio.Bitmap(90, 18, 1)
     g.append(displayio.TileGrid(mode_bg, pixel_shader=black_pal, x=3, y=3))
     g.append(label.Label(
@@ -389,17 +380,17 @@ def render_display():
         scale=1,
     ))
 
-    # Name + tag
+    # name (top right)
     g.append(label.Label(
         terminalio.FONT,
-        text=MY_NAME + " [ESP-NOW]",
+        text=(MY_NAME[:18] + " [ESP]"),
         color=0x000000,
         anchor_point=(1.0, 0.0),
         anchored_position=(290, 6),
         scale=1,
     ))
 
-    # Status line
+    # status line
     g.append(label.Label(
         terminalio.FONT,
         text=MODE_DESCRIPTIONS[current_mode],
@@ -411,7 +402,6 @@ def render_display():
 
     y = 42
 
-    # SEARCH: list peers + match %
     if current_mode == MODE_SEARCH:
         if BROADCAST_TOPIC:
             g.append(label.Label(
@@ -435,8 +425,8 @@ def render_display():
             ))
             y += 12
 
-            for mac_key, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:4]:
-                common, pct = compute_match(MY_INTERESTS, peer["interests"])
+            for _, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:4]:
+                _, pct = compute_match(MY_INTERESTS, peer["interests"])
                 line = "{} {}% {}".format(peer["name"][:10], pct, rssi_bar(peer["rssi"]))
                 g.append(label.Label(
                     terminalio.FONT,
@@ -448,7 +438,7 @@ def render_display():
                 ))
                 y += 11
 
-        # Badge display toggle (D11)
+        # badge toggle area
         if badge_visible:
             sep = displayio.Bitmap(296, 1, 1)
             g.append(displayio.TileGrid(sep, pixel_shader=gray_pal, x=0, y=90))
@@ -489,7 +479,6 @@ def render_display():
                 scale=1,
             ))
 
-        # Hints
         g.append(label.Label(
             terminalio.FONT,
             text="A:Chat  D:Badge",
@@ -499,7 +488,6 @@ def render_display():
             scale=1,
         ))
 
-    # CHAT: show common interest + sync status
     else:
         peer_name = "(none)"
         peer_rssi = None
@@ -532,7 +520,7 @@ def render_display():
             common_text = "Common: " + chat_common[chat_common_idx]
             idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common))
         else:
-            common_text = "Common: (none yet)"
+            common_text = "Common: (none)"
             idx_text = ""
 
         g.append(label.Label(
@@ -575,14 +563,14 @@ def render_display():
             scale=1,
         ))
 
-    display.root_group = g
-    while display.time_to_refresh > 0:
-        time.sleep(0.2)
-    display.refresh()
+    epd.root_group = g
+    time.sleep(epd.time_to_refresh + 0.01)
+    epd.refresh()
+    while epd.busy:
+        pass
 
     last_display_refresh = time.monotonic()
     display_dirty = False
-
 
 # -- Mode transitions --
 def set_mode(new_mode):
@@ -612,12 +600,14 @@ def set_mode(new_mode):
         contact_shared = False
 
     current_mode = new_mode
+
+    # Small LED blink on mode change
     pixels.fill(MODE_COLORS[new_mode])
     time.sleep(0.15)
     pixels.fill(0)
+
     display_dirty = True
     do_broadcast()
-
 
 # ===== MAIN LOOP =====
 try:
@@ -630,19 +620,19 @@ try:
 
         # Buttons
         if current_mode == MODE_SEARCH:
-            # D15: Enter chat
+            # D15: enter CHAT
             if not buttons[BTN_A].value:
                 set_mode(MODE_CHAT)
                 wait_release(BTN_A)
 
-            # D11: toggle badge
+            # D11: toggle badge display
             elif not buttons[BTN_D].value:
                 badge_visible = not badge_visible
                 display_dirty = True
                 wait_release(BTN_D)
 
         else:  # MODE_CHAT
-            # D15: back to search
+            # D15: back to SEARCH
             if not buttons[BTN_A].value:
                 set_mode(MODE_SEARCH)
                 wait_release(BTN_A)
@@ -676,29 +666,36 @@ try:
         # Receive
         receive_all()
 
-        # Refresh display (rate-limited for e-ink)
+        # Refresh display (rate-limited)
         if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
             render_display()
 
         # LEDs
         update_leds(phase)
         phase = (phase + 1) % 200
+
         time.sleep(0.08)
 
 except Exception as ex:
+    # Blink NeoPixels red
     for _ in range(10):
         pixels.fill((255, 0, 0))
         time.sleep(0.15)
         pixels.fill(0)
         time.sleep(0.15)
+
+    # Try to show error on E-Ink using the working refresh pattern
     try:
-        display = board.DISPLAY
+        epd = board.DISPLAY
+        epd.rotation = 270
+
         g = displayio.Group()
         bg = displayio.Bitmap(296, 128, 1)
         pal = displayio.Palette(1)
         pal[0] = 0xFFFFFF
         g.append(displayio.TileGrid(bg, pixel_shader=pal))
-        g.append(label.Label(
+
+        err = label.Label(
             terminalio.FONT,
             text="ERROR:\n" + str(ex)[:200],
             color=0x000000,
@@ -706,10 +703,13 @@ except Exception as ex:
             anchored_position=(4, 4),
             scale=1,
             line_spacing=1.2,
-        ))
-        display.root_group = g
-        while display.time_to_refresh > 0:
-            time.sleep(0.2)
-        display.refresh()
+        )
+        g.append(err)
+
+        epd.root_group = g
+        time.sleep(epd.time_to_refresh + 0.01)
+        epd.refresh()
+        while epd.busy:
+            pass
     except Exception:
         pass
