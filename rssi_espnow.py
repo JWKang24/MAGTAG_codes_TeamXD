@@ -318,6 +318,398 @@ def pick_closest_peer():
 # -------------------------
 # Display / LEDs / Mode transitions
 # -------------------------
-# ... (all display, LED, render_display(), set_mode() remain identical to original)
-# Use exactly your previous code for display, LED, and mode transitions.
-# Only modification: receive_all() now calls check_badge_matches()
+# -- LEDs --
+def update_leds(phase):
+    r, g, b = MODE_COLORS[current_mode]
+    if current_mode == MODE_SEARCH:
+        n = len(nearby_peers)
+        speed = max(20, 40 - n * 4)
+        scale = abs((phase % speed) - speed // 2) / (speed / 2.0)
+        br = int(g * (0.3 + 0.7 * scale))
+        pixels.fill((0, br, 0))
+    else:
+        idx = (phase // 5) % 4
+        pixels.fill((5, 4, 0))
+        pixels[idx] = (min(r * 3, 255), min(g * 3, 255), 0)
+        pixels[(idx + 2) % 4] = (min(r * 2, 255), min(g * 2, 255), 0)
+    pixels.show()
+
+
+def rssi_bar(rssi):
+    if rssi > -50:
+        return "***"
+    if rssi > -70:
+        return "**"
+    return "*"
+
+
+# -- Display (uses your working refresh pattern) --
+def render_display():
+    global last_display_refresh, display_dirty
+
+    epd = board.DISPLAY
+    epd.rotation = 270
+
+    g = displayio.Group()
+
+    # background
+    bg = displayio.Bitmap(296, 128, 1)
+    pal = displayio.Palette(1)
+    pal[0] = 0xFFFFFF
+    g.append(displayio.TileGrid(bg, pixel_shader=pal))
+
+    black_pal = displayio.Palette(1)
+    black_pal[0] = 0x000000
+
+    gray_pal = displayio.Palette(1)
+    gray_pal[0] = 0x999999
+
+    # divider
+    bar = displayio.Bitmap(296, 3, 1)
+    g.append(displayio.TileGrid(bar, pixel_shader=black_pal, x=0, y=24))
+
+    # mode box
+    mode_bg = displayio.Bitmap(90, 18, 1)
+    g.append(displayio.TileGrid(mode_bg, pixel_shader=black_pal, x=3, y=3))
+    g.append(label.Label(
+        terminalio.FONT,
+        text=" " + MODE_NAMES[current_mode] + " ",
+        color=0xFFFFFF,
+        anchor_point=(0.0, 0.0),
+        anchored_position=(6, 6),
+        scale=1,
+    ))
+
+    # name (top right)
+    g.append(label.Label(
+        terminalio.FONT,
+        text=(MY_NAME[:18] + " [ESP]"),
+        color=0x000000,
+        anchor_point=(1.0, 0.0),
+        anchored_position=(290, 6),
+        scale=1,
+    ))
+
+    # status line
+    g.append(label.Label(
+        terminalio.FONT,
+        text=MODE_DESCRIPTIONS[current_mode],
+        color=0x000000,
+        anchor_point=(0.0, 0.0),
+        anchored_position=(6, 30),
+        scale=1,
+    ))
+
+    y = 42
+
+    if current_mode == MODE_SEARCH:
+        if BROADCAST_TOPIC:
+            g.append(label.Label(
+                terminalio.FONT,
+                text="Topic: " + BROADCAST_TOPIC[:30],
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+            ))
+            y += 12
+
+        if nearby_peers:
+            g.append(label.Label(
+                terminalio.FONT,
+                text="Nearby: " + str(len(nearby_peers)),
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+            ))
+            y += 12
+
+            for _, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:4]:
+                _, pct = compute_match(MY_INTERESTS, peer["interests"])
+                line = "{} {}% {}".format(peer["name"][:10], pct, rssi_bar(peer["rssi"]))
+                g.append(label.Label(
+                    terminalio.FONT,
+                    text=line,
+                    color=0x000000,
+                    anchor_point=(0.0, 0.0),
+                    anchored_position=(10, y),
+                    scale=1,
+                ))
+                y += 11
+
+        # badge toggle area
+        if badge_visible:
+            sep = displayio.Bitmap(296, 1, 1)
+            g.append(displayio.TileGrid(sep, pixel_shader=gray_pal, x=0, y=90))
+            g.append(label.Label(
+                terminalio.FONT,
+                text="Interests:",
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, 94),
+                scale=1,
+            ))
+            row1 = ", ".join(MY_INTERESTS[:4])
+            row2 = ", ".join(MY_INTERESTS[4:8])
+            g.append(label.Label(
+                terminalio.FONT,
+                text=row1,
+                color=0x555555,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, 106),
+                scale=1,
+            ))
+            if row2:
+                g.append(label.Label(
+                    terminalio.FONT,
+                    text=row2,
+                    color=0x555555,
+                    anchor_point=(0.0, 0.0),
+                    anchored_position=(6, 118),
+                    scale=1,
+                ))
+        else:
+            g.append(label.Label(
+                terminalio.FONT,
+                text="[D] show interests",
+                color=0x999999,
+                anchor_point=(0.5, 0.0),
+                anchored_position=(148, 112),
+                scale=1,
+            ))
+
+        g.append(label.Label(
+            terminalio.FONT,
+            text="A:Chat  D:Badge",
+            color=0xAAAAAA,
+            anchor_point=(0.5, 1.0),
+            anchored_position=(148, 127),
+            scale=1,
+        ))
+
+    else:
+        peer_name = "(none)"
+        peer_rssi = None
+        if chat_peer_mac and chat_peer_mac in nearby_peers:
+            peer_name = nearby_peers[chat_peer_mac]["name"][:16]
+            peer_rssi = nearby_peers[chat_peer_mac]["rssi"]
+
+        g.append(label.Label(
+            terminalio.FONT,
+            text="With: " + peer_name,
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(6, y),
+            scale=1,
+        ))
+        y += 12
+
+        if peer_rssi is not None:
+            g.append(label.Label(
+                terminalio.FONT,
+                text="Signal: " + rssi_bar(peer_rssi),
+                color=0x555555,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+            ))
+            y += 12
+
+        if chat_common:
+            common_text = "Common: " + chat_common[chat_common_idx]
+            idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common))
+        else:
+            common_text = "Common: (none)"
+            idx_text = ""
+
+        g.append(label.Label(
+            terminalio.FONT,
+            text=common_text[:32],
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(6, y),
+            scale=2,
+        ))
+        y += 22
+
+        if idx_text:
+            g.append(label.Label(
+                terminalio.FONT,
+                text=idx_text,
+                color=0x555555,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+            ))
+            y += 12
+
+        share_text = "Contact shared: YES" if contact_shared else "Contact shared: no"
+        g.append(label.Label(
+            terminalio.FONT,
+            text=share_text,
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(6, 100),
+            scale=1,
+        ))
+
+        g.append(label.Label(
+            terminalio.FONT,
+            text="A:Back  B:Share  D:Next",
+            color=0xAAAAAA,
+            anchor_point=(0.5, 1.0),
+            anchored_position=(148, 127),
+            scale=1,
+        ))
+
+    epd.root_group = g
+    time.sleep(epd.time_to_refresh + 0.01)
+    epd.refresh()
+    while epd.busy:
+        pass
+
+    last_display_refresh = time.monotonic()
+    display_dirty = False
+
+# -- Mode transitions --
+def set_mode(new_mode):
+    global current_mode, display_dirty
+    global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared
+
+    if new_mode == current_mode:
+        return
+
+    if new_mode == MODE_CHAT:
+        # If chat not initiated by recommendation, pick closest by RSSI
+        if chat_peer_mac is None:
+            chat_peer_mac = pick_closest_peer()
+
+        chat_common_idx = 0
+        chat_idx_ver = 0
+        contact_shared = False
+        chat_common = []
+
+        if chat_peer_mac and chat_peer_mac in nearby_peers:
+            chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
+    else:
+        chat_peer_mac = None
+        chat_common = []
+        chat_common_idx = 0
+        chat_idx_ver = 0
+        contact_shared = False
+
+    current_mode = new_mode
+
+    # Small LED blink on mode change
+    pixels.fill(MODE_COLORS[new_mode])
+    time.sleep(0.15)
+    pixels.fill(0)
+
+    display_dirty = True
+    do_broadcast()
+
+# ===== MAIN LOOP =====
+try:
+    render_display()
+    do_broadcast()
+
+    phase = 0
+    while True:
+        now = time.monotonic()
+
+        # Buttons
+        if current_mode == MODE_SEARCH:
+            # D15: enter CHAT
+            if not buttons[BTN_A].value:
+                set_mode(MODE_CHAT)
+                wait_release(BTN_A)
+
+            # D11: toggle badge display
+            elif not buttons[BTN_D].value:
+                badge_visible = not badge_visible
+                display_dirty = True
+                wait_release(BTN_D)
+
+        else:  # MODE_CHAT
+            # D15: back to SEARCH
+            if not buttons[BTN_A].value:
+                set_mode(MODE_SEARCH)
+                wait_release(BTN_A)
+
+            # D14: share contact
+            elif not buttons[BTN_B].value:
+                contact_shared = True
+                display_dirty = True
+                do_broadcast()
+                pixels.fill((0, 0, 80))
+                time.sleep(0.15)
+                pixels.fill(0)
+                wait_release(BTN_B)
+
+            # D11: next common interest (synced)
+            elif not buttons[BTN_D].value:
+                if chat_common:
+                    chat_common_idx = (chat_common_idx + 1) % len(chat_common)
+                    chat_idx_ver += 1
+                    display_dirty = True
+                    do_broadcast()
+                pixels.fill((60, 60, 60))
+                time.sleep(0.12)
+                pixels.fill(0)
+                wait_release(BTN_D)
+
+        # Periodic broadcast
+        if now - last_broadcast >= BROADCAST_INTERVAL:
+            do_broadcast()
+
+        # Receive
+        receive_all()
+
+        # Refresh display (rate-limited)
+        if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
+            render_display()
+
+        # LEDs
+        update_leds(phase)
+        phase = (phase + 1) % 200
+
+        time.sleep(0.08)
+
+except Exception as ex:
+    # Blink NeoPixels red
+    for _ in range(10):
+        pixels.fill((255, 0, 0))
+        time.sleep(0.15)
+        pixels.fill(0)
+        time.sleep(0.15)
+
+    # Try to show error on E-Ink using the working refresh pattern
+    try:
+        epd = board.DISPLAY
+        epd.rotation = 270
+
+        g = displayio.Group()
+        bg = displayio.Bitmap(296, 128, 1)
+        pal = displayio.Palette(1)
+        pal[0] = 0xFFFFFF
+        g.append(displayio.TileGrid(bg, pixel_shader=pal))
+
+        err = label.Label(
+            terminalio.FONT,
+            text="ERROR:\n" + str(ex)[:200],
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(4, 4),
+            scale=1,
+            line_spacing=1.2,
+        )
+        g.append(err)
+
+        epd.root_group = g
+        time.sleep(epd.time_to_refresh + 0.01)
+        epd.refresh()
+        while epd.busy:
+            pass
+    except Exception:
+        pass
