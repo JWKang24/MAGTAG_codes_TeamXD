@@ -1,67 +1,67 @@
-# E-Ink Image Test for Adafruit MagTag
-# Displays ./images/Georgia.bmp full screen
+# SPDX-FileCopyrightText: 2021 Carter Nelson for Adafruit Industries
+#
+# SPDX-License-Identifier: MIT
 
 import time
 import board
+import alarm
 import displayio
-from adafruit_display_text import label
-import terminalio
+import os
 
-# Prevent auto reload while testing
-import supervisor
-supervisor.runtime.autoreload = False
+# get the display
+epd = board.DISPLAY
+epd.rotation = 270
 
-display = board.DISPLAY
+# choose two wake buttons
+buttons = (board.BUTTON_A, board.BUTTON_B)
+pin_alarms = [alarm.pin.PinAlarm(pin=pin, value=False, pull=True) for pin in buttons]
 
-# Release any previous displays
-displayio.release_displays()
-
+# list BMP files in /images (sorted for consistent order)
 try:
-    # Load BMP file
-    bmp = displayio.OnDiskBitmap("/images/Georgia.bmp")
-    tile_grid = displayio.TileGrid(
-        bmp,
-        pixel_shader=bmp.pixel_shader
-    )
+    files = [f for f in os.listdir("/images") if f.lower().endswith(".bmp")]
+    files.sort()
+except Exception:
+    files = []
 
-    group = displayio.Group()
-    group.append(tile_grid)
+# if no images, show nothing and sleep
+if not files:
+    alarm.exit_and_deep_sleep_until_alarms(*pin_alarms)
 
-    display.root_group = group
+# persistent index in sleep memory
+# sleep_memory is a bytearray; use 2 bytes to store index up to 65535 images
+idx = alarm.sleep_memory[0] | (alarm.sleep_memory[1] << 8)
+idx %= len(files)
 
-    # Wait until display is ready
-    while display.time_to_refresh > 0:
-        time.sleep(0.1)
+# detect which button woke us (if available)
+direction = 1  # default: next
+try:
+    wa = alarm.wake_alarm
+    if isinstance(wa, alarm.pin.PinAlarm):
+        if wa.pin == board.BUTTON_B:
+            direction = -1
+except Exception:
+    pass
 
-    display.refresh()
+# advance index based on wake source
+idx = (idx + direction) % len(files)
 
-except Exception as e:
-    # If image fails to load, show error text
-    group = displayio.Group()
+# store index back
+alarm.sleep_memory[0] = idx & 0xFF
+alarm.sleep_memory[1] = (idx >> 8) & 0xFF
 
-    bg = displayio.Bitmap(296, 128, 1)
-    palette = displayio.Palette(1)
-    palette[0] = 0xFFFFFF
-    group.append(displayio.TileGrid(bg, pixel_shader=palette))
+# show bitmap
+bmp_file = "/images/" + files[idx]
+bitmap = displayio.OnDiskBitmap(bmp_file)
+tile_grid = displayio.TileGrid(bitmap, pixel_shader=bitmap.pixel_shader)
 
-    error_label = label.Label(
-        terminalio.FONT,
-        text="ERROR:\n" + str(e),
-        color=0x000000,
-        anchor_point=(0.0, 0.0),
-        anchored_position=(4, 4),
-        scale=1,
-        line_spacing=1.2,
-    )
+group = displayio.Group()
+group.append(tile_grid)
+epd.root_group = group
 
-    group.append(error_label)
-    display.root_group = group
+time.sleep(epd.time_to_refresh + 0.01)
+epd.refresh()
+while epd.busy:
+    pass
 
-    while display.time_to_refresh > 0:
-        time.sleep(0.1)
-
-    display.refresh()
-
-# Do nothing afterward (E-Ink is static)
-while True:
-    time.sleep(1)
+# go to sleep until next button press
+alarm.exit_and_deep_sleep_until_alarms(*pin_alarms)
