@@ -1,0 +1,24 @@
+import board
+import displayio
+from adafruit_display_shapes.rect import Rect
+from adafruit_display_text.label import Label
+from adafruit_miniqr import QrCode
+
+display = board.DISPLAY
+
+# URL to encode
+url = f"http://{wifi.radio.ipv4_address}/"
+
+# Generate QR code
+qr = QrCode(url, error_correction=QrCode.ERROR_CORRECT_L)
+
+# Draw QR code to display
+g = displayio.Group()
+size = 4  # pixel size per QR module
+for y in range(qr.modules_count):
+    for x in range(qr.modules_count):
+        if qr.get_module(x, y):
+            pixel = Rect(x*size, y*size, size, size, fill=0x000000)
+            g.append(pixel)
+
+display.root_group = g
