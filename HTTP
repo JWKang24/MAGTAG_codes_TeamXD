@@ -1,0 +1,375 @@
+# code.py — MagTag ESP-NOW “Common Interests” + HTTP badge upload
+import supervisor
+supervisor.runtime.autoreload = False
+
+import time
+import os
+import board
+import displayio
+import terminalio
+import neopixel
+import digitalio
+import espnow
+import wifi
+import socketpool
+from adafruit_display_text import label
+
+# ---------------------------
+# Wi-Fi for HTTP server
+# ---------------------------
+WIFI_SSID = "YOUR_WIFI_SSID"
+WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+
+print("Connecting to Wi-Fi...")
+wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
+print("Connected! IP:", wifi.radio.ipv4_address)
+
+# HTTP Server Setup
+pool = socketpool.SocketPool(wifi.radio)
+http_server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+http_server.bind(("0.0.0.0", 80))
+http_server.listen(1)
+print("HTTP server listening on port 80")
+
+# ---------------------------
+# NeoPixel feedback
+# ---------------------------
+pixels = neopixel.NeoPixel(board.NEOPIXEL, 4, brightness=0.15)
+pixels.fill(0)
+
+def flash_pixels(color=(0, 80, 80), times=2, delay=0.08):
+    for _ in range(times):
+        pixels.fill(color)
+        time.sleep(delay)
+        pixels.fill(0)
+        time.sleep(delay)
+
+# ---------------------------
+# Load settings (MY_NAME, BROADCAST_TOPIC, ESPNOW_CHANNEL)
+# ---------------------------
+def _get_env_str(key, default=""):
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v)
+
+def _get_env_int(key, default):
+    v = os.getenv(key)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _parse_interests(csv_text):
+    if not csv_text:
+        return []
+    parts = [p.strip() for p in csv_text.split(",")]
+    return [p for p in parts if p][:12]
+
+MY_NAME = _get_env_str("MY_NAME", "MagTag")
+BROADCAST_TOPIC = _get_env_str("BROADCAST_TOPIC", "circuitpython")
+MY_INTERESTS = _parse_interests(_get_env_str("MY_INTERESTS", "python,circuitpython"))
+MAX_BADGES = 12
+ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
+
+# ---------------------------
+# ESP-NOW setup
+# ---------------------------
+wifi.radio.enabled = True
+wifi.radio.start_ap(" ", "", channel=ESPNOW_CHANNEL, max_connections=0)
+wifi.radio.stop_ap()
+
+BROADCAST_MAC = b"\xff\xff\xff\xff\xff\xff"
+e = espnow.ESPNow(buffer_size=1024)
+broadcast_peer = espnow.Peer(mac=BROADCAST_MAC, channel=ESPNOW_CHANNEL)
+e.peers.append(broadcast_peer)
+my_mac = wifi.radio.mac_address
+
+# ---------------------------
+# Modes & buttons
+# ---------------------------
+MODE_SEARCH = 0
+MODE_CHAT = 1
+current_mode = MODE_SEARCH
+badge_visible = False
+last_broadcast = 0.0
+last_display_refresh = 0.0
+DISPLAY_REFRESH = 8.0
+BROADCAST_INTERVAL = 2.0
+PEER_TIMEOUT = 15.0
+display_dirty = True
+
+# Buttons: A,B,C,D = D15,D14,D12,D11
+button_pins = (board.D15, board.D14, board.D12, board.D11)
+buttons = []
+for pin in button_pins:
+    b = digitalio.DigitalInOut(pin)
+    b.direction = digitalio.Direction.INPUT
+    b.pull = digitalio.Pull.UP
+    buttons.append(b)
+
+BTN_A, BTN_B, BTN_C, BTN_D = 0,1,2,3
+
+def wait_release(btn_index):
+    while not buttons[btn_index].value:
+        time.sleep(0.03)
+
+# ---------------------------
+# Nearby peers / chat state
+# ---------------------------
+nearby_peers = {}
+chat_peer_mac = None
+chat_common = []
+chat_common_idx = 0
+chat_idx_ver = 0
+contact_shared = False
+
+# ---------------------------
+# ESP-NOW message protocol
+# ---------------------------
+MAX_MSG_LEN = 250
+
+def build_message():
+    interests_str = ",".join(MY_INTERESTS[:MAX_BADGES])
+    topic_str = BROADCAST_TOPIC[:30] if current_mode == MODE_SEARCH else ""
+
+    peer_mac_hex = ""
+    shared_flag = "0"
+    idx_str = "0"
+    ver_str = "0"
+
+    if current_mode == MODE_CHAT:
+        peer_mac_hex = chat_peer_mac.hex() if chat_peer_mac else ""
+        shared_flag = "1" if contact_shared else "0"
+        idx_str = str(chat_common_idx)
+        ver_str = str(chat_idx_ver)
+
+    parts = [
+        str(current_mode),
+        MY_NAME[:20],
+        interests_str,
+        topic_str,
+        peer_mac_hex,
+        shared_flag,
+        idx_str,
+        ver_str,
+    ]
+    msg = "|".join(parts)
+    return msg[:MAX_MSG_LEN]
+
+def parse_message(data):
+    try:
+        text = str(data, "utf-8")
+        parts = text.split("|")
+        while len(parts) < 8:
+            parts.append("")
+        mode = int(parts[0])
+        name = parts[1]
+        interests = [s.strip() for s in parts[2].split(",") if s.strip()]
+        topic = parts[3]
+        peer_mac = bytes.fromhex(parts[4]) if parts[4] else None
+        shared = (parts[5] == "1")
+        common_idx = int(parts[6]) if parts[6] else 0
+        idx_ver = int(parts[7]) if parts[7] else 0
+        return {
+            "mode": mode,
+            "name": name,
+            "interests": interests,
+            "topic": topic,
+            "peer_mac": peer_mac,
+            "contact_shared": shared,
+            "common_idx": common_idx,
+            "idx_ver": idx_ver,
+        }
+    except Exception:
+        return None
+
+def compute_match(mine, theirs):
+    mine_set = set(s.lower() for s in mine)
+    theirs_set = set(s.lower() for s in theirs)
+    common = mine_set & theirs_set
+    total = len(mine_set | theirs_set)
+    if total == 0:
+        return [], 0
+    pct = int((len(common) / total) * 100)
+    return sorted(common), pct
+
+# ---------------------------
+# Broadcast
+# ---------------------------
+def do_broadcast():
+    global last_broadcast
+    msg = build_message()
+    try:
+        e.send(bytes(msg,"utf-8"), broadcast_peer)
+    except Exception:
+        pass
+    last_broadcast = time.monotonic()
+
+# ---------------------------
+# Receive
+# ---------------------------
+def receive_all():
+    global display_dirty, chat_common, chat_common_idx, contact_shared, chat_idx_ver
+
+    changed = False
+    now = time.monotonic()
+
+    while e:
+        packet = e.read()
+        if packet is None:
+            break
+        info = parse_message(packet.msg)
+        if info is None:
+            continue
+
+        mac_key = bytes(packet.mac)
+        if mac_key == bytes(my_mac):
+            continue
+
+        old = nearby_peers.get(mac_key)
+        nearby_peers[mac_key] = {
+            "name": info["name"],
+            "mode": info["mode"],
+            "interests": info["interests"],
+            "topic": info["topic"],
+            "rssi": packet.rssi,
+            "last_seen": now,
+            "peer_mac": info["peer_mac"],
+            "contact_shared": info["contact_shared"],
+            "common_idx": info["common_idx"],
+            "idx_ver": info["idx_ver"],
+        }
+
+        if old is None:
+            changed = True
+            flash_pixels()
+        else:
+            if (old["mode"] != info["mode"] or
+                old["topic"] != info["topic"] or
+                old["name"] != info["name"]):
+                changed = True
+
+    # prune stale
+    stale = [k for k,v in nearby_peers.items() if now - v["last_seen"] > PEER_TIMEOUT]
+    for k in stale:
+        del nearby_peers[k]
+        changed = True
+
+    if changed:
+        display_dirty = True
+
+# ---------------------------
+# HTTP Badge Upload Handling
+# ---------------------------
+def build_form_page():
+    badge_list = ", ".join(MY_INTERESTS)
+    return f"""
+<html>
+<head><title>MagTag Badge Upload</title></head>
+<body>
+<h2>Current Badges: {badge_list}</h2>
+<form method="POST" action="/">
+<input type="text" name="badges" placeholder="comma-separated badges" size="50">
+<br><br>
+<input type="submit" value="Upload Badges">
+</form>
+</body>
+</html>
+"""
+
+def parse_badge_input(body):
+    try:
+        body_str = body.decode("utf-8")
+        if body_str.startswith("badges="):
+            badges_raw = body_str[7:]
+            badges = [b.strip() for b in badges_raw.split(",") if b.strip()]
+            return badges[:MAX_BADGES]
+    except Exception as e:
+        print("Error parsing badges:", e)
+    return []
+
+def http_poll():
+    """
+    Non-blocking check for incoming HTTP connections
+    """
+    http_server.settimeout(0.01)
+    try:
+        client, addr = http_server.accept()
+        request = client.recv(1024)
+        if not request:
+            client.close()
+            return
+        request_lines = request.split(b"\r\n")
+        if not request_lines:
+            client.close()
+            return
+        request_line = request_lines[0].decode("utf-8")
+        method, path, _ = request_line.split()
+
+        if method == "POST":
+            blank_line_index = request_lines.index(b"")
+            body = b"\r\n".join(request_lines[blank_line_index+1:])
+            new_badges = parse_badge_input(body)
+            if new_badges:
+                global MY_INTERESTS, display_dirty
+                MY_INTERESTS = new_badges
+                print("Updated badges via HTTP:", MY_INTERESTS)
+                flash_pixels()
+                display_dirty = True
+
+        # Respond with form page
+        response = f"""HTTP/1.1 200 OK
+Content-Type: text/html
+
+{build_form_page()}"""
+        client.send(response.encode("utf-8"))
+        client.close()
+
+    except Exception:
+        pass
+
+# ---------------------------
+# Main Loop
+# ---------------------------
+try:
+    do_broadcast()
+    phase = 0
+    while True:
+        now = time.monotonic()
+
+        # Buttons (search/chat and badge toggle)
+        if current_mode == MODE_SEARCH:
+            if not buttons[BTN_A].value:
+                current_mode = MODE_CHAT
+                wait_release(BTN_A)
+                display_dirty = True
+            elif not buttons[BTN_D].value:
+                badge_visible = not badge_visible
+                display_dirty = True
+                wait_release(BTN_D)
+        else:
+            if not buttons[BTN_A].value:
+                current_mode = MODE_SEARCH
+                wait_release(BTN_A)
+                display_dirty = True
+
+        # ESP-NOW
+        if now - last_broadcast >= BROADCAST_INTERVAL:
+            do_broadcast()
+        receive_all()
+
+        # HTTP Server poll (non-blocking)
+        http_poll()
+
+        # TODO: insert render_display() and update_leds(phase) here if desired
+        # For simplicity in this merged example, we focus on ESP-NOW + HTTP badges
+
+        phase = (phase + 1) % 200
+        time.sleep(0.08)
+
+except Exception as ex:
+    print("Fatal error:", ex)
+    pixels.fill((255,0,0))
