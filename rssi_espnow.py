@@ -39,7 +39,6 @@ def _parse_interests(csv_text):
     return [p for p in parts if p][:12]
 
 MY_NAME = _get_env_str("MY_NAME", "MagTag")
-BROADCAST_TOPIC = _get_env_str("BROADCAST_TOPIC", "circuitpython")
 MY_INTERESTS = _parse_interests(_get_env_str("MY_INTERESTS", "python,circuitpython"))
 ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
 
@@ -107,6 +106,7 @@ chat_common = []
 chat_common_idx = 0
 chat_idx_ver = 0
 contact_shared = False
+chat_force_empty_topic = False
 
 # -- Badge match alert state --
 RSSI_BADGE_THRESHOLD = -65
@@ -117,13 +117,15 @@ seen_badge_devices = set()
 # -------------------------
 def build_message():
     interests_str = ",".join(MY_INTERESTS[:12])
-    topic_str = BROADCAST_TOPIC[:30] if current_mode == MODE_SEARCH else ""
+    topic_str = ""
     peer_mac_hex = ""
     shared_flag = "0"
     idx_str = "0"
     ver_str = "0"
 
     if current_mode == MODE_CHAT:
+        if (not chat_force_empty_topic) and chat_common:
+            topic_str = chat_common[chat_common_idx][:30]
         peer_mac_hex = chat_peer_mac.hex() if chat_peer_mac else ""
         shared_flag = "1" if contact_shared else "0"
         idx_str = str(chat_common_idx)
@@ -151,7 +153,7 @@ def parse_message(data):
         mode = int(parts[0])
         name = parts[1]
         interests = [s.strip() for s in parts[2].split(",") if s.strip()]
-        topic = parts[3]
+        topic = parts[3].strip()
         peer_mac = bytes.fromhex(parts[4]) if parts[4] else None
         shared = (parts[5] == "1")
         common_idx = int(parts[6]) if parts[6] else 0
@@ -178,6 +180,14 @@ def compute_match(mine, theirs):
         return [], 0
     pct = int((len(common) / total) * 100)
     return sorted(common), pct
+
+
+def first_common_interest(mine, theirs):
+    theirs_set = set(s.lower() for s in theirs)
+    for item in mine:
+        if item.lower() in theirs_set:
+            return item
+    return None
 
 # -------------------------
 # Badge match alert
@@ -222,7 +232,7 @@ def flash_new_peer():
         time.sleep(0.08)
 
 def receive_all():
-    global display_dirty, chat_common, chat_common_idx, contact_shared, chat_idx_ver
+    global display_dirty, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
 
     changed = False
     now = time.monotonic()
@@ -262,8 +272,8 @@ def receive_all():
             flash_new_peer()
         else:
             if (old["mode"] != info["mode"] or
-                old["topic"] != info["topic"] or
-                old["name"] != info["name"]):
+                old["name"] != info["name"] or
+                old["topic"] != info["topic"]):
                 changed = True
 
     # prune stale
@@ -272,11 +282,34 @@ def receive_all():
         del nearby_peers[k]
         changed = True
 
-    # CHAT sync logic remains unchanged
-    if current_mode == MODE_CHAT and chat_peer_mac:
-        peer = nearby_peers.get(chat_peer_mac)
-        if peer and peer.get("peer_mac") == bytes(my_mac):
+    if current_mode == MODE_CHAT:
+        # Follow the strongest broadcaster in the same active topic to allow open join.
+        if (not chat_force_empty_topic) and chat_common:
+            active_topic = chat_common[chat_common_idx].lower()
+            best_mac = None
+            best_rssi = -999
+            for mac, candidate in nearby_peers.items():
+                if candidate.get("mode") != MODE_CHAT:
+                    continue
+                if candidate.get("topic", "").lower() != active_topic:
+                    continue
+                if candidate["rssi"] > best_rssi:
+                    best_mac = mac
+                    best_rssi = candidate["rssi"]
+            if best_mac is not None:
+                chat_peer_mac = best_mac
+
+        peer = nearby_peers.get(chat_peer_mac) if chat_peer_mac else None
+        if peer:
             new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
+            peer_topic = peer.get("topic", "")
+            if (not chat_force_empty_topic) and peer_topic and peer_topic.lower() in set(s.lower() for s in MY_INTERESTS):
+                if not any(c.lower() == peer_topic.lower() for c in new_common):
+                    new_common = [peer_topic] + new_common
+                else:
+                    new_common = [c for c in new_common if c.lower() == peer_topic.lower()] + [
+                        c for c in new_common if c.lower() != peer_topic.lower()
+                    ]
             if new_common != chat_common:
                 chat_common = new_common
                 if chat_common and chat_common_idx >= len(chat_common):
@@ -390,99 +423,111 @@ def render_display():
         scale=1,
     ))
 
+    search_large = (current_mode == MODE_SEARCH and not badge_visible)
+    search_text_scale = 2 if current_mode == MODE_SEARCH else 1
+
     # status line
     g.append(label.Label(
         terminalio.FONT,
         text=MODE_DESCRIPTIONS[current_mode],
         color=0x000000,
         anchor_point=(0.0, 0.0),
-        anchored_position=(6, 30),
-        scale=1,
+        anchored_position=(6, 28 if current_mode == MODE_SEARCH else 30),
+        scale=search_text_scale,
     ))
 
-    y = 42
+    y = 50 if current_mode == MODE_SEARCH else 42
 
     if current_mode == MODE_SEARCH:
-        if BROADCAST_TOPIC:
+        matched_topic = None
+        matched_rssi = -999
+        for _, peer in nearby_peers.items():
+            topic = ""
+            if peer.get("mode") == MODE_CHAT and peer.get("topic"):
+                peer_topic = peer.get("topic", "")
+                if any(peer_topic.lower() == mine.lower() for mine in MY_INTERESTS):
+                    topic = peer_topic
+            if not topic:
+                topic = first_common_interest(MY_INTERESTS, peer.get("interests", []))
+            if topic and peer.get("rssi", -999) > matched_rssi:
+                matched_topic = topic
+                matched_rssi = peer.get("rssi", -999)
+
+        if matched_topic:
             g.append(label.Label(
                 terminalio.FONT,
-                text="Topic: " + BROADCAST_TOPIC[:30],
+                text="Topic: " + matched_topic[:14 if search_text_scale == 2 else 30],
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
-                scale=1,
+                scale=search_text_scale,
             ))
-            y += 12
+            y += 18 if search_text_scale == 2 else 12
+
+        g.append(label.Label(
+            terminalio.FONT,
+            text="Nearby: " + str(len(nearby_peers)),
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(6, y),
+            scale=search_text_scale,
+        ))
+        y += 18 if search_text_scale == 2 else 12
 
         if nearby_peers:
-            g.append(label.Label(
-                terminalio.FONT,
-                text="Nearby: " + str(len(nearby_peers)),
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=1,
-            ))
-            y += 12
-
-            for _, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:4]:
+            max_peers = 2 if search_text_scale == 2 else 4
+            for _, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:max_peers]:
                 _, pct = compute_match(MY_INTERESTS, peer["interests"])
-                line = "{} {}% {}".format(peer["name"][:10], pct, rssi_bar(peer["rssi"]))
+                line = "{} {}% {}".format(
+                    peer["name"][:8 if search_text_scale == 2 else 10],
+                    pct,
+                    rssi_bar(peer["rssi"]),
+                )
                 g.append(label.Label(
                     terminalio.FONT,
                     text=line,
                     color=0x000000,
                     anchor_point=(0.0, 0.0),
                     anchored_position=(10, y),
-                    scale=1,
+                    scale=search_text_scale,
                 ))
-                y += 11
+                y += 17 if search_text_scale == 2 else 11
 
         # badge toggle area
         if badge_visible:
             sep = displayio.Bitmap(296, 1, 1)
-            g.append(displayio.TileGrid(sep, pixel_shader=gray_pal, x=0, y=90))
+            g.append(displayio.TileGrid(sep, pixel_shader=gray_pal, x=0, y=78))
             g.append(label.Label(
                 terminalio.FONT,
                 text="Interests:",
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
-                anchored_position=(6, 94),
+                anchored_position=(6, 82),
                 scale=1,
             ))
             row1 = ", ".join(MY_INTERESTS[:4])
             row2 = ", ".join(MY_INTERESTS[4:8])
             g.append(label.Label(
                 terminalio.FONT,
-                text=row1,
+                text=row1[:20],
                 color=0x555555,
                 anchor_point=(0.0, 0.0),
-                anchored_position=(6, 106),
-                scale=1,
+                anchored_position=(6, 94),
+                scale=2,
             ))
             if row2:
                 g.append(label.Label(
                     terminalio.FONT,
-                    text=row2,
+                    text=row2[:20],
                     color=0x555555,
                     anchor_point=(0.0, 0.0),
-                    anchored_position=(6, 118),
-                    scale=1,
+                    anchored_position=(6, 110),
+                    scale=2,
                 ))
-        else:
-            g.append(label.Label(
-                terminalio.FONT,
-                text="[D] show interests",
-                color=0x999999,
-                anchor_point=(0.5, 0.0),
-                anchored_position=(148, 112),
-                scale=1,
-            ))
-
         g.append(label.Label(
             terminalio.FONT,
-            text="A:Chat  D:Badge",
-            color=0xAAAAAA,
+            text="[A] Chat  [B] Pairing  [D] Badge",
+            color=0x333333,
             anchor_point=(0.5, 1.0),
             anchored_position=(148, 127),
             scale=1,
@@ -556,8 +601,8 @@ def render_display():
 
         g.append(label.Label(
             terminalio.FONT,
-            text="A:Back  B:Share  D:Next",
-            color=0xAAAAAA,
+            text="[A] Back  [B] Share  [D] Next",
+            color=0x333333,
             anchor_point=(0.5, 1.0),
             anchored_position=(148, 127),
             scale=1,
@@ -573,31 +618,53 @@ def render_display():
     display_dirty = False
 
 # -- Mode transitions --
-def set_mode(new_mode):
+def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
-    global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared
+    global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared, chat_force_empty_topic
 
     if new_mode == current_mode:
         return
 
     if new_mode == MODE_CHAT:
-        # If chat not initiated by recommendation, pick closest by RSSI
-        if chat_peer_mac is None:
-            chat_peer_mac = pick_closest_peer()
-
+        chat_force_empty_topic = force_empty_topic
         chat_common_idx = 0
         chat_idx_ver = 0
         contact_shared = False
         chat_common = []
 
-        if chat_peer_mac and chat_peer_mac in nearby_peers:
-            chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
+        if force_closest:
+            chat_peer_mac = pick_closest_peer()
+            if chat_peer_mac and chat_peer_mac in nearby_peers:
+                chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
+        else:
+            # Prefer joining an ongoing chat that has a shared topic.
+            best_mac = None
+            best_rssi = -999
+            best_topic = None
+            mine_lower = set(s.lower() for s in MY_INTERESTS)
+            for mac, peer in nearby_peers.items():
+                topic = peer.get("topic", "")
+                if peer.get("mode") == MODE_CHAT and topic and topic.lower() in mine_lower:
+                    if peer["rssi"] > best_rssi:
+                        best_mac = mac
+                        best_rssi = peer["rssi"]
+                        best_topic = topic
+
+            if best_mac is not None:
+                chat_peer_mac = best_mac
+                chat_common = [best_topic]
+            else:
+                if chat_peer_mac is None:
+                    chat_peer_mac = pick_closest_peer()
+                if chat_peer_mac and chat_peer_mac in nearby_peers:
+                    chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
     else:
         chat_peer_mac = None
         chat_common = []
         chat_common_idx = 0
         chat_idx_ver = 0
         contact_shared = False
+        chat_force_empty_topic = False
 
     current_mode = new_mode
 
@@ -624,6 +691,11 @@ try:
             if not buttons[BTN_A].value:
                 set_mode(MODE_CHAT)
                 wait_release(BTN_A)
+
+            # D14: closest-peer chat (no topic broadcast)
+            elif not buttons[BTN_B].value:
+                set_mode(MODE_CHAT, force_closest=True, force_empty_topic=True)
+                wait_release(BTN_B)
 
             # D11: toggle badge display
             elif not buttons[BTN_D].value:
