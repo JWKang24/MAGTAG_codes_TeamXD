@@ -416,7 +416,7 @@ def render_display():
     # name (top right)
     g.append(label.Label(
         terminalio.FONT,
-        text=(MY_NAME[:18] + " [ESP]"),
+        text=(MY_NAME[:18]),
         color=0x000000,
         anchor_point=(1.0, 0.0),
         anchored_position=(290, 6),
