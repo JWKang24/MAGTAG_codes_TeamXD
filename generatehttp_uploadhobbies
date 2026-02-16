@@ -1,0 +1,138 @@
+import wifi
+import socketpool
+import time
+import supervisor
+import microcontroller
+import toml
+
+SSID = "YOUR_WIFI"
+PASSWORD = "YOUR_PASS"
+
+ALL_BADGES = [
+    "python", "circuitpython", "arduino", "esp32",
+    "hardware", "iot", "robotics", "ai",
+    "music", "gaming", "art", "hacking"
+]
+
+# -------------------------------
+# Load settings.toml
+# -------------------------------
+def load_settings():
+    try:
+        with open("/settings.toml", "r") as f:
+            data = toml.load(f)
+            name = data.get("name", "Unknown")
+            hobbies = data.get("hobbies", "")
+            hobbies_list = [h.strip() for h in hobbies.split(",") if h.strip()]
+            return name, hobbies_list
+    except Exception as e:
+        print("Failed to load settings.toml:", e)
+        return "Unknown", []
+
+def save_settings(name, hobbies_list):
+    hobbies_str = ",".join(hobbies_list)
+    with open("/settings.toml", "w") as f:
+        f.write(f'name = "{name}"\n')
+        f.write(f'hobbies = "{hobbies_str}"\n')
+
+name, current_hobbies = load_settings()
+
+# -------------------------------
+# WiFi + Server Setup
+# -------------------------------
+wifi.radio.connect(SSID, PASSWORD)
+pool = socketpool.SocketPool(wifi.radio)
+server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+server.bind(("0.0.0.0", 80))
+server.listen(1)
+
+print("Server running at http://", wifi.radio.ipv4_address)
+
+# -------------------------------
+# HTML Page
+# -------------------------------
+def build_form_page(name, current_hobbies):
+    html = f"""
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Badge Setup</title>
+</head>
+<body style="font-family: sans-serif;">
+<h2>Badge Setup for {name}</h2>
+<form method="POST" action="/">
+"""
+    for badge in ALL_BADGES:
+        checked = "checked" if badge in current_hobbies else ""
+        html += f"""
+<label>
+  <input type="checkbox" name="badge" value="{badge}" {checked}>
+  {badge}
+</label><br>
+"""
+    html += """
+<br>
+<input type="submit" value="Save Badges">
+</form>
+</body>
+</html>
+"""
+    return html
+
+# -------------------------------
+# POST Parser
+# -------------------------------
+def parse_badges_from_post(body):
+    body_str = body.decode("utf-8")
+    pairs = body_str.split("&")
+    badges = []
+
+    for p in pairs:
+        if p.startswith("badge="):
+            badge = p[6:]
+            badge = badge.replace("+", " ")
+            badge = badge.replace("%20", " ")
+            badges.append(badge)
+
+    return badges
+
+# -------------------------------
+# HTTP Response
+# -------------------------------
+def http_response(body):
+    return f"""HTTP/1.1 200 OK
+Content-Type: text/html
+Connection: close
+
+{body}""".encode("utf-8")
+
+# -------------------------------
+# Main Loop
+# -------------------------------
+while True:
+    client, addr = server.accept()
+    print("Client:", addr)
+
+    request = client.recv(2048)
+    lines = request.split(b"\r\n")
+
+    method = lines[0].decode().split(" ")[0]
+
+    if method == "POST":
+        blank = lines.index(b"")
+        body = b"\r\n".join(lines[blank+1:])
+
+        new_hobbies = parse_badges_from_post(body)
+        print("New hobbies:", new_hobbies)
+
+        save_settings(name, new_hobbies)
+
+        client.send(http_response("<h2>Saved! Rebooting...</h2>"))
+        client.close()
+        time.sleep(1)
+        microcontroller.reset()
+
+    else:
+        page = build_form_page(name, current_hobbies)
+        client.send(http_response(page))
+        client.close()
