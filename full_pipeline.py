@@ -1,22 +1,41 @@
-import time
-import wifi
+import os
+import supervisor
 
-# Stage 1: run survey flow. This module now exits after Save.
-import user_survey
+supervisor.runtime.autoreload = False
 
-print("Survey complete. Switching to ESP-NOW matching mode...")
-time.sleep(0.5)
+_MARKER = "/.start_espnow"
 
-try:
-    if hasattr(user_survey, "server") and hasattr(user_survey.server, "stop"):
-        user_survey.server.stop()
-except Exception:
-    pass
 
-try:
-    wifi.radio.stop_station()
-except Exception:
-    pass
+def _marker_exists():
+    try:
+        os.stat(_MARKER)
+        return True
+    except Exception:
+        return False
 
-# Stage 2: start nearby user search/chat logic.
-import rssi_espnow
+
+def _write_marker():
+    with open(_MARKER, "w") as f:
+        f.write("1\n")
+
+
+def _clear_marker():
+    try:
+        os.remove(_MARKER)
+    except Exception:
+        pass
+
+
+if _marker_exists():
+    # Phase 2: fresh boot into ESP-NOW runtime.
+    _clear_marker()
+    import rssi_espnow
+else:
+    # Phase 1: run survey. After completion, force a clean reload.
+    import user_survey
+    try:
+        _write_marker()
+        supervisor.reload()
+    except Exception:
+        # Fallback if marker write/reload fails.
+        import rssi_espnow

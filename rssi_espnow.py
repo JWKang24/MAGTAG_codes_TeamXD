@@ -189,6 +189,7 @@ def first_common_interest(mine, theirs):
             return item
     return None
 
+
 # -------------------------
 # Badge match alert
 # -------------------------
