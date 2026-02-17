@@ -1,0 +1,69 @@
+1. Map badges to BMP files
+
+Assume your badges are named exactly like the interest strings:
+
+# Example mapping: badge name → BMP file
+badge_images = { 
+    "python": "/python.bmp",
+    "circuitpython": "/circuitpython.bmp",
+    "robotics": "/robotics.bmp",
+    # ... add all badges here
+}
+
+2. Function to flash the badge image:
+
+import displayio
+from adafruit_imageload import load
+
+def flash_badge_image(badge_name, duration=5.0):
+    """
+    Display the BMP for the given badge for `duration` seconds.
+    """
+    bmp_file = badge_images.get(badge_name.lower())
+    if not bmp_file:
+        print(f"No BMP found for badge {badge_name}")
+        return
+
+    try:
+        bitmap, palette = load(bmp_file)
+        g = displayio.Group()
+
+        # Optional white background
+        bg = displayio.Bitmap(296, 128, 1)
+        bgpal = displayio.Palette(1)
+        bgpal[0] = 0xFFFFFF
+        g.append(displayio.TileGrid(bg, pixel_shader=bgpal))
+
+        # Center the badge image
+        x = (296 - bitmap.width) // 2
+        y = (128 - bitmap.height) // 2
+        g.append(displayio.TileGrid(bitmap, pixel_shader=palette, x=x, y=y))
+
+        epd.root_group = g
+        epd.refresh()
+        while epd.busy:
+            pass
+
+        time.sleep(duration)  # hold for duration
+    except Exception as e:
+        print(f"Error displaying badge {badge_name}: {e}")
+
+3. Call it when a new common badge is detected
+
+Where you compute matches in your ESP-NOW loop:
+
+new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
+
+# If a new common badge appeared
+for badge in new_common:
+    if badge not in chat_common:
+        chat_common.append(badge)
+        chat_common_idx = 0
+
+        # Flash the corresponding badge image
+        flash_badge_image(badge, duration=5.0)
+
+        display_dirty = True  # refresh normal display after
+
+
+This will flash one badge at a time for 5 seconds each when a new commonality is detected.
