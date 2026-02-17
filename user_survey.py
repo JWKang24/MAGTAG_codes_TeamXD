@@ -232,6 +232,7 @@ if not ALL_INTERESTS:
 
 current_name = (os.getenv("MY_NAME") or "MagTag").strip()
 current_hobbies = parse_csv(os.getenv("MY_INTERESTS") or "")
+survey_complete = False
 
 # ----------------------------
 # HTTP Server
@@ -242,7 +243,7 @@ server = Server(pool, "/")
 
 @server.route("/", [GET, POST])
 def index(request: Request):
-    global current_name, current_hobbies
+    global current_name, current_hobbies, survey_complete
 
     method = "GET"
     try:
@@ -267,7 +268,8 @@ def index(request: Request):
 
         try:
             current_name, current_hobbies = write_settings(name, filtered)
-            msg = "Saved to settings.toml."
+            survey_complete = True
+            msg = "Saved. Starting nearby user search..."
         except Exception as ex:
             msg = "Save failed: {}".format(ex)
 
@@ -345,6 +347,6 @@ print("QR displayed. Scan:", url)
 # ----------------------------
 # Main loop
 # ----------------------------
-while True:
+while not survey_complete:
     server.poll()
     time.sleep(0.01)

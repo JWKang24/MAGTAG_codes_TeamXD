@@ -376,6 +376,61 @@ def rssi_bar(rssi):
     return "*"
 
 
+def _pack_interest_lines(interests, max_chars, max_lines=2, truncate=False):
+    lines = []
+    current = ""
+    for raw in interests:
+        item = (raw or "").strip()
+        if not item:
+            continue
+        if len(item) > max_chars:
+            item = item[:max(0, max_chars - 3)] + "..."
+
+        part = item if not current else ", " + item
+        if len(current) + len(part) <= max_chars:
+            current += part
+            continue
+
+        if len(lines) >= (max_lines - 1):
+            if not truncate:
+                return None
+            if len(current) > (max_chars - 3):
+                current = current[:max(0, max_chars - 3)] + "..."
+            else:
+                suffix = ", ..."
+                if len(current) + len(suffix) <= max_chars:
+                    current += suffix
+                else:
+                    current = current[:max(0, max_chars - 3)] + "..."
+            lines.append(current)
+            return lines
+
+        lines.append(current)
+        current = item
+
+    if current:
+        lines.append(current)
+
+    if len(lines) > max_lines:
+        return None
+    return lines
+
+
+def get_badge_interest_layout(interests):
+    items = [s for s in interests[:8] if s and s.strip()]
+    if not items:
+        return 1, ["(none)"]
+
+    for scale in (2, 1):
+        max_chars = 23 if scale == 2 else 46
+        lines = _pack_interest_lines(items, max_chars=max_chars, max_lines=2, truncate=False)
+        if lines is not None:
+            return scale, lines
+
+    lines = _pack_interest_lines(items, max_chars=46, max_lines=2, truncate=True)
+    return 1, lines or ["(none)"]
+
+
 # -- Display (uses your working refresh pattern) --
 def render_display():
     global last_display_refresh, display_dirty
@@ -505,25 +560,19 @@ def render_display():
                 anchored_position=(6, 82),
                 scale=1,
             ))
-            row1 = ", ".join(MY_INTERESTS[:4])
-            row2 = ", ".join(MY_INTERESTS[4:8])
-            g.append(label.Label(
-                terminalio.FONT,
-                text=row1[:20],
-                color=0x555555,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, 94),
-                scale=2,
-            ))
-            if row2:
+            badge_scale, badge_lines = get_badge_interest_layout(MY_INTERESTS)
+            line_step = 16 if badge_scale == 2 else 10
+            y_pos = 94
+            for row in badge_lines[:2]:
                 g.append(label.Label(
                     terminalio.FONT,
-                    text=row2[:20],
+                    text=row,
                     color=0x555555,
                     anchor_point=(0.0, 0.0),
-                    anchored_position=(6, 110),
-                    scale=2,
+                    anchored_position=(6, y_pos),
+                    scale=badge_scale,
                 ))
+                y_pos += line_step
         g.append(label.Label(
             terminalio.FONT,
             text="[A] Chat  [B] Pairing  [D] Badge",
