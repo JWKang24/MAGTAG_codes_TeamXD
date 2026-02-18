@@ -1,74 +1,67 @@
-#include <WiFi.h>                 // For Wi-Fi connectivity
-#include <esp_now.h>              // For ESP-NOW communication
-#include <Preferences.h>          // For NVS storage
-#include <Adafruit_ThinkInk.h>    // For MagTag ThinkInk display
-#include <Adafruit_NeoPixel.h>    // For NeoPixel LED control
-#include <WebServer.h>            // For survey web page
+#include <WiFi.h>                 
+#include <esp_now.h>              
+#include <Preferences.h>          
+#include <Adafruit_ThinkInk.h>    
+#include <Adafruit_NeoPixel.h>    
+#include <WebServer.h>            
+#include <qrcode.h>                // QR code library for survey
 
 // --------- Pins ----------
-#define BUTTON_MODE   15  // D15 - toggle search/chat mode
-#define BUTTON_SURVEY 14  // D14 - enter survey / pairing
-#define BUTTON_UNUSED 12  // D12 - reserved / optional
-#define BUTTON_BADGE  11  // D11 - toggle badge display
-#define NEOPIXEL_PIN  21  // NeoPixel data pin
+#define BUTTON_A 15               // D15
+#define BUTTON_B 14               // D14
+#define BUTTON_C 12               // D12
+#define BUTTON_D 11               // D11
+#define NEOPIXEL_PIN 21           
 
 // --------- Constants ----------
-#define MAX_PEERS 32
-#define MAX_INTERESTS 12
-#define MAX_MSG_LEN 250
-#define BROADCAST_INTERVAL 2000
-#define PEER_TIMEOUT 15000
-#define RSSI_BADGE_THRESHOLD -65
-#define SURVEY_PORT 80
+#define MAX_PEERS 32              
+#define MAX_INTERESTS 12          
+#define MAX_MSG_LEN 250           
+#define BROADCAST_INTERVAL 2000   
+#define PEER_TIMEOUT 15000        
+#define RSSI_BADGE_THRESHOLD -65  
+#define SURVEY_PORT 80            
 
-// --------- Display pins (MagTag 2.9") ----------
+// MagTag 2.9" b/w display pins
 #define EPD_DC      7
 #define EPD_CS      8
 #define EPD_BUSY    -1
 #define SRAM_CS     -1
 #define EPD_RESET   6
 
-// --------- Display object ----------
 ThinkInk_290_Grayscale4_EAAMFGN display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY);
+Adafruit_NeoPixel pixels(4, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800); 
 
-// --------- LEDs ----------
-Adafruit_NeoPixel pixels(4, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+Preferences prefs;             
+bool surveyComplete = false;    
+bool badgeVisible = false;      
+String myName = "MagTag";       
+String myInterests[MAX_INTERESTS]; 
+int interestCount = 0;          
+int espnowChannel = 6;          
 
-// --------- State ----------
-Preferences prefs;
-bool surveyComplete = false;
-bool badgeVisible = false;
-String myName = "MagTag";
-String myInterests[MAX_INTERESTS];
-int interestCount = 0;
-int espnowChannel = 6;
+enum Mode { MODE_SEARCH = 0, MODE_CHAT = 1 }; 
+Mode currentMode = MODE_SEARCH;               
 
-// --------- Modes ----------
-enum Mode { MODE_SEARCH = 0, MODE_CHAT = 1 };
-Mode currentMode = MODE_SEARCH;
-
-// --------- Peer Struct ----------
 struct PeerInfo {
-  uint8_t mac[6];
-  String name;
-  String interests[MAX_INTERESTS];
-  int interestCount;
-  int rssi;
-  unsigned long lastSeen;
+  uint8_t mac[6];              
+  String name;                 
+  String interests[MAX_INTERESTS]; 
+  int interestCount;           
+  int rssi;                    
+  unsigned long lastSeen;      
 };
-PeerInfo peers[MAX_PEERS];
-int peerCount = 0;
+PeerInfo peers[MAX_PEERS];      
+int peerCount = 0;              
 
-// --------- Web server ----------
-WebServer server(SURVEY_PORT);
+WebServer server(SURVEY_PORT);  
 
-// --------- Marker for survey ----------
-#define MARKER_KEY "marker"
-bool markerExists = false;
+#define MARKER_FILE "/start_espnow" 
+bool markerExists = false;        
 
-// --------- Helpers ----------
+// ------------------ Helpers ------------------
 
-// Build ESP-NOW message
+// Build ESP-NOW broadcast message
 String buildMessage() {
   String interests = "";
   for (int i = 0; i < interestCount; i++) {
@@ -82,7 +75,7 @@ String buildMessage() {
 // Flash NeoPixels for badge match
 void flashBadgeMatch() {
   for (int i = 0; i < 2; i++) {
-    pixels.fill(pixels.Color(0, 80, 80));
+    pixels.fill(pixels.Color(0,80,80));
     pixels.show();
     delay(80);
     pixels.clear();
@@ -96,7 +89,7 @@ void waitRelease(int pin) {
   while (!digitalRead(pin)) delay(30);
 }
 
-// --------- ESP-NOW receive callback ----------
+// ESP-NOW receive callback
 void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   String msg = String((char*)data).substring(0, len);
   int rssi = info->rx_ctrl->rssi;
@@ -116,35 +109,32 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     peers[peerCount].rssi = rssi;
     peers[peerCount].lastSeen = millis();
     peerCount++;
-
     if (rssi > RSSI_BADGE_THRESHOLD) flashBadgeMatch();
   }
 }
 
-// --------- Display ----------
+// Display update only if changed
 Mode lastMode = MODE_SEARCH;
 int lastPeerCount = -1;
 bool lastBadgeVisible = false;
-
 void renderDisplay() {
-  if (currentMode != lastMode || peerCount != lastPeerCount || badgeVisible != lastBadgeVisible) {
-    display.begin();
-    display.clearBuffer();
-    display.setTextColor(EPD_BLACK);
-    display.setCursor(4, 16);
-    display.print(currentMode == MODE_SEARCH ? "SEARCH" : "CHAT");
-    display.setCursor(4, 36);
-    display.print("Nearby: ");
-    display.print(peerCount);
-    display.display();
+  if (currentMode == lastMode && peerCount == lastPeerCount && badgeVisible == lastBadgeVisible) return;
+  lastMode = currentMode;
+  lastPeerCount = peerCount;
+  lastBadgeVisible = badgeVisible;
 
-    lastMode = currentMode;
-    lastPeerCount = peerCount;
-    lastBadgeVisible = badgeVisible;
-  }
+  display.begin();
+  display.clearBuffer();
+  display.setTextColor(EPD_BLACK);
+  display.setCursor(4,16);
+  display.print(currentMode == MODE_SEARCH ? "SEARCH" : "CHAT");
+  display.setCursor(4,36);
+  display.print("Nearby: "); 
+  display.print(peerCount);
+  display.display();
 }
 
-// --------- Survey page ----------
+// Build survey HTML
 String buildSurveyPage() {
   String html = "<html><body>";
   html += "<h2>Badge Setup</h2>";
@@ -160,6 +150,7 @@ String buildSurveyPage() {
   return html;
 }
 
+// Handle survey HTTP requests
 void handleSurvey() {
   if (server.method() == HTTP_POST) {
     myName = server.arg("name");
@@ -168,30 +159,44 @@ void handleSurvey() {
       String val = server.arg("interest" + String(i));
       if (val.length() > 0) myInterests[interestCount++] = val;
     }
-
     prefs.begin("cfg", false);
     prefs.putString("name", myName);
-    for (int i = 0; i < interestCount; i++) {
-      prefs.putString("interest" + String(i), myInterests[i]);
-    }
-    prefs.putBool(MARKER_KEY, true);
+    for (int i = 0; i < interestCount; i++) prefs.putString("interest" + String(i), myInterests[i]);
+    prefs.putBool("marker", true);
     prefs.end();
-
     surveyComplete = true;
     markerExists = true;
   }
   server.send(200, "text/html", buildSurveyPage());
 }
 
-// --------- Setup ----------
+// ------------------ QR Code ------------------
+void displayQRCode(const char* url) {
+  QRCode qrcode;
+  uint8_t qrcodeData[qrcode_getBufferSize(3)];
+  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, url);
+
+  display.begin();
+  display.clearBuffer();
+  int scale = 3;
+
+  for (uint8_t y=0; y<qrcode.size; y++) {
+    for (uint8_t x=0; x<qrcode.size; x++) {
+      if (qrcode_getModule(&qrcode,x,y)) display.fillRect(x*scale,y*scale,scale,scale,EPD_BLACK);
+    }
+  }
+  display.display();
+}
+
+// ------------------ Setup ------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(BUTTON_MODE, INPUT_PULLUP);
-  pinMode(BUTTON_SURVEY, INPUT_PULLUP);
-  pinMode(BUTTON_UNUSED, INPUT_PULLUP);
-  pinMode(BUTTON_BADGE, INPUT_PULLUP);
+  pinMode(BUTTON_A, INPUT_PULLUP);
+  pinMode(BUTTON_B, INPUT_PULLUP);
+  pinMode(BUTTON_C, INPUT_PULLUP);
+  pinMode(BUTTON_D, INPUT_PULLUP);
 
   pixels.begin();
   pixels.setBrightness(40);
@@ -202,73 +207,55 @@ void setup() {
   prefs.begin("cfg", true);
   myName = prefs.getString("name", "MagTag");
   espnowChannel = prefs.getInt("channel", 6);
-  for (int i = 0; i < MAX_INTERESTS; i++) {
-    String v = prefs.getString("interest" + String(i), "");
-    if (v.length() > 0) myInterests[interestCount++] = v;
+  for (int i=0;i<MAX_INTERESTS;i++){
+    String v = prefs.getString("interest"+String(i),"");
+    if(v.length()>0) myInterests[interestCount++] = v;
   }
-  markerExists = prefs.getBool(MARKER_KEY, false);
+  markerExists = prefs.getBool("marker", false);
 
-  // Survey mode
-  if (!markerExists || !digitalRead(BUTTON_SURVEY)) {
+  // --------- SURVEY MODE ----------
+  if (!markerExists || !digitalRead(BUTTON_B)) {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MagTag Survey");
+    displayQRCode("http://192.168.4.1/");
 
     server.on("/", handleSurvey);
     server.begin();
 
-    renderDisplay();
     while (!surveyComplete) {
       server.handleClient();
-      renderDisplay();
       delay(50);
     }
   }
 
-  // ESP-NOW
+  // --------- ESP-NOW ----------
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  WiFi.setChannel(espnowChannel);
+  esp_wifi_set_channel(espnowChannel, WIFI_SECOND_CHAN_NONE);
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
-    return;
-  }
-
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); return; }
   esp_now_register_recv_cb(onReceive);
 
-  // Broadcast peer
-  uint8_t broadcastMac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+  uint8_t broadcastMac[6]={0xff,0xff,0xff,0xff,0xff,0xff};
   esp_now_peer_info_t peer{};
-  memcpy(peer.peer_addr, broadcastMac, 6);
-  peer.channel = espnowChannel;
-  peer.encrypt = false;
+  memcpy(peer.peer_addr,broadcastMac,6);
+  peer.channel=espnowChannel;
+  peer.encrypt=false;
   esp_now_add_peer(&peer);
 
   renderDisplay();
 }
 
-// --------- Loop ----------
+// ------------------ Loop ------------------
 unsigned long lastBroadcast = 0;
 void loop() {
-  // Periodic broadcast
   if (millis() - lastBroadcast > BROADCAST_INTERVAL) {
     String msg = buildMessage();
-    esp_now_send((uint8_t*)"\xff\xff\xff\xff\xff\xff", (uint8_t*)msg.c_str(), msg.length());
+    esp_now_send((uint8_t*)"\xff\xff\xff\xff\xff\xff",(uint8_t*)msg.c_str(), msg.length());
     lastBroadcast = millis();
   }
 
-  // Buttons
-  if (!digitalRead(BUTTON_MODE)) {
-    currentMode = (currentMode == MODE_SEARCH) ? MODE_CHAT : MODE_SEARCH;
-    renderDisplay();
-    waitRelease(BUTTON_MODE);
-  }
-
-  if (!digitalRead(BUTTON_BADGE)) {
-    badgeVisible = !badgeVisible;
-    renderDisplay();
-    waitRelease(BUTTON_BADGE);
-  }
+  if (!digitalRead(BUTTON_A)) { currentMode = (currentMode==MODE_SEARCH)?MODE_CHAT:MODE_SEARCH; renderDisplay(); waitRelease(BUTTON_A); }
+  if (!digitalRead(BUTTON_D)) { badgeVisible = !badgeVisible; renderDisplay(); waitRelease(BUTTON_D); }
 
   renderDisplay();
   delay(120);
