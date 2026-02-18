@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>        // <-- add this
 #include <Adafruit_NeoPixel.h>
+
 
 // --------- Pins ----------
 #define NEOPIXEL_PIN 21
