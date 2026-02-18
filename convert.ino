@@ -1,172 +1,281 @@
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <Preferences.h>
-#include <Adafruit_EPD.h>
-#include "qrcode.h"
-#include <esp_now.h>
+#include <WiFi.h>                 // For Wi-Fi connectivity (STA/AP mode)
+#include <esp_now.h>              // For ESP-NOW communication
+#include <Preferences.h>          // For NVS storage of survey and settings
+#include <Adafruit_EPD.h>         // For E-Ink display handling
+#include <Adafruit_NeoPixel.h>    // For NeoPixel LED control
+#include <WebServer.h>            // For serving the user survey page
 
-#define BUTTON_A 15
-#define MAX_INTERESTS 5
+// --------- Pins ----------
+#define BUTTON_A 15               // Button A (enter chat / toggle modes)
+#define BUTTON_B 14               // Button B (share / pairing)
+#define BUTTON_D 11               // Button D (toggle badge display)
+#define NEOPIXEL_PIN 21           // NeoPixel data pin
 
-// --------- Globals ----------
-Preferences prefs;
-AsyncWebServer server(80);
+// --------- Constants ----------
+#define MAX_PEERS 32              // Max number of nearby devices tracked
+#define MAX_INTERESTS 12          // Max number of user interests
+#define MAX_MSG_LEN 250           // Max length of ESP-NOW message
+#define BROADCAST_INTERVAL 2000   // Time between broadcasts (ms)
+#define PEER_TIMEOUT 15000        // Peer timeout to remove stale peers (ms)
+#define RSSI_BADGE_THRESHOLD -65  // Minimum RSSI for badge alert
+#define SURVEY_PORT 80            // HTTP server port for survey
 
-// MagTag 2.9" e-ink (SSD1680)
-Adafruit_SSD1680 display(296, 128, -1, -1, -1, -1, -1);
+// --------- Display ----------
+Adafruit_SSD1680 display(296, 128, -1, -1, -1, -1, -1); // E-Ink display object
 
-bool surveyMode = false;
-bool surveyComplete = false;
+// --------- LEDs ----------
+Adafruit_NeoPixel pixels(4, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800); // 4 NeoPixels
 
-String myName = "MagTag";
-String interests[MAX_INTERESTS];
-int interestCount = 0;
+// --------- State ----------
+Preferences prefs;             // NVS storage object
+bool surveyComplete = false;    // Flag if survey has been completed
+bool badgeVisible = false;      // Flag for showing badge interests
+String myName = "MagTag";       // Default device/user name
+String myInterests[MAX_INTERESTS]; // Array to store user interests
+int interestCount = 0;          // Current number of interests
+int espnowChannel = 6;          // ESP-NOW Wi-Fi channel
 
-const char* SSID = "YOUR_WIFI";
-const char* PASS = "YOUR_PASS";
+// --------- Modes ----------
+enum Mode { MODE_SEARCH = 0, MODE_CHAT = 1 }; // Device operating modes
+Mode currentMode = MODE_SEARCH;               // Current mode
 
-const char* ALL_INTERESTS[] = {"python", "circuitpython", "electronics"};
-const int INTEREST_COUNT = 3;
+// --------- Peer Struct ----------
+struct PeerInfo {
+  uint8_t mac[6];              // Peer MAC address
+  String name;                 // Peer name
+  String interests[MAX_INTERESTS]; // Peer interests
+  int interestCount;           // Number of interests
+  int rssi;                    // Last RSSI reading
+  unsigned long lastSeen;      // Last seen timestamp
+};
+PeerInfo peers[MAX_PEERS];      // Array to hold nearby peers
+int peerCount = 0;              // Current number of nearby peers
 
-// --------- HTML ----------
-String page(const String& msg) {
-  String html =
-    "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
-    "<title>Badge Setup</title></head><body style='font-family:sans-serif;max-width:560px;margin:20px auto;'>"
-    "<h2>Badge Setup</h2>";
+// --------- Web server ----------
+WebServer server(SURVEY_PORT);  // HTTP server for survey page
 
-  if (msg.length()) html += "<p style='color:#0a7a2f'><b>" + msg + "</b></p>";
+// --------- Marker for boot ----------
+#define MARKER_FILE "/start_espnow" // Marker to indicate survey completion
+bool markerExists = false;         // True if marker exists
 
-  html += "<form method='POST'>"
-          "<label><b>Name</b></label><br>"
-          "<input name='name' value='" + myName + "' style='width:100%;padding:8px;'><br><br>"
-          "<b>Choose up to 5 interests</b><br>";
+// --------- Helpers ----------
 
-  for (int i = 0; i < INTEREST_COUNT; i++) {
-    html += "<label><input type='checkbox' name='badge' value='" + String(ALL_INTERESTS[i]) + "'> ";
-    html += ALL_INTERESTS[i];
-    html += "</label><br>";
+// Build the ESP-NOW broadcast message
+String buildMessage() {
+  String interests = "";
+  for (int i = 0; i < interestCount; i++) {
+    interests += myInterests[i];        // Add each interest
+    if (i < interestCount - 1) interests += ","; // Comma-separated
   }
 
-  html += "<br><input type='submit' value='Save'></form></body></html>";
+  // Mode|Name|Interests||||0|0
+  String msg = String((int)currentMode) + "|" +
+               myName.substring(0,20) + "|" +
+               interests + "||||0|0";
+
+  return msg.substring(0, MAX_MSG_LEN); // Ensure max length
+}
+
+// Flash NeoPixels to indicate a badge match
+void flashBadgeMatch() {
+  for (int i = 0; i < 2; i++) {
+    pixels.fill(pixels.Color(0,80,80)); // Cyan flash
+    pixels.show();
+    delay(80);
+    pixels.clear();
+    pixels.show();
+    delay(80);
+  }
+}
+
+// Wait for button release to avoid repeated triggers
+void waitRelease(int pin) {
+  while (!digitalRead(pin)) delay(30);
+}
+
+// --------- ESP-NOW RX callback ----------
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  String msg = String((char*)data).substring(0, len); // Convert to string
+  int rssi = info->rx_ctrl->rssi;                     // Get RSSI
+
+  bool found = false;
+  // Check if peer already tracked
+  for (int i = 0; i < peerCount; i++) {
+    if (!memcmp(peers[i].mac, info->src_addr, 6)) {  // Compare MAC
+      peers[i].rssi = rssi;
+      peers[i].lastSeen = millis();                  // Update timestamp
+      found = true;
+      break;
+    }
+  }
+
+  // If new peer and space available
+  if (!found && peerCount < MAX_PEERS) {
+    memcpy(peers[peerCount].mac, info->src_addr, 6);
+    peers[peerCount].rssi = rssi;
+    peers[peerCount].lastSeen = millis();
+    peerCount++;
+
+    // Flash if RSSI strong enough
+    if (rssi > RSSI_BADGE_THRESHOLD) {
+      flashBadgeMatch();
+    }
+  }
+}
+
+// --------- Display ----------
+void renderDisplay() {
+  display.begin();          // Initialize display
+  display.clearBuffer();    // Clear buffer
+  display.setTextColor(EPD_BLACK);
+  display.setCursor(4, 16);
+  display.print(currentMode == MODE_SEARCH ? "SEARCH" : "CHAT"); // Show mode
+  display.setCursor(4, 36);
+  display.print("Nearby: "); 
+  display.print(peerCount);  // Show number of peers
+  display.display();         // Update E-Ink
+}
+
+// --------- Survey Page ----------
+String buildSurveyPage() {
+  String html = "<html><body>";
+  html += "<h2>Badge Setup</h2>";
+  html += "<form method='POST'>";
+  html += "Name: <input name='name' value='" + myName + "'><br>";
+  // Add input fields for interests
+  for (int i = 0; i < MAX_INTERESTS; i++) {
+    html += "<input type='text' name='interest" + String(i) + "' value='";
+    if (i < interestCount) html += myInterests[i];
+    html += "'><br>";
+  }
+  html += "<input type='submit' value='Save'>";
+  html += "</form></body></html>";
   return html;
 }
 
-// --------- QR ----------
-void drawQR(const char* url) {
-  display.begin();
-  display.clearBuffer();
-
-  QRCode qr;
-  uint8_t data[qrcode_getBufferSize(3)];
-  qrcode_initText(&qr, data, 3, ECC_LOW, url);
-
-  int scale = 2;
-  int x0 = (296 - qr.size * scale) / 2;
-  int y0 = (128 - qr.size * scale) / 2;
-
-  for (int y = 0; y < qr.size; y++) {
-    for (int x = 0; x < qr.size; x++) {
-      if (qrcode_getModule(&qr, x, y)) {
-        display.fillRect(x0 + x * scale, y0 + y * scale, scale, scale, EPD_BLACK);
-      }
-    }
-  }
-  display.display();
-}
-
-// --------- Survey ----------
-void startSurvey() {
-  Serial.println("Starting survey mode");
-
-  prefs.begin("cfg", false);
-  myName = prefs.getString("name", "MagTag");
-
-  WiFi.begin(SSID, PASS);
-  while (WiFi.status() != WL_CONNECTED) delay(300);
-
-  String url = "http://" + WiFi.localIP().toString();
-  drawQR(url.c_str());
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-    req->send(200, "text/html", page(""));
-  });
-
-  server.on("/", HTTP_POST, [](AsyncWebServerRequest* req) {
-    if (req->hasParam("name", true)) {
-      myName = req->getParam("name", true)->value();
-      prefs.putString("name", myName);
-    }
-
+// Handle survey HTTP requests
+void handleSurvey() {
+  if (server.method() == HTTP_POST) {
+    myName = server.arg("name"); // Save name
     interestCount = 0;
-    for (int i = 0; i < req->params(); i++) {
-      auto* p = req->getParam(i);
-      if (p->isPost() && p->name() == "badge" && interestCount < MAX_INTERESTS) {
-        interests[interestCount++] = p->value();
+    // Save all entered interests
+    for (int i = 0; i < MAX_INTERESTS; i++) {
+      String argName = "interest" + String(i);
+      String val = server.arg(argName);
+      if (val.length() > 0) {
+        myInterests[interestCount++] = val;
       }
     }
+    // Save preferences to NVS
+    prefs.begin("cfg", false);
+    prefs.putString("name", myName);
+    for (int i = 0; i < interestCount; i++) {
+      prefs.putString("interest" + String(i), myInterests[i]);
+    }
+    prefs.end();
 
-    prefs.putBool("start_espnow", true);  // marker
     surveyComplete = true;
-
-    req->send(200, "text/html", page("Saved. Rebooting into ESP-NOW mode..."));
-  });
-
-  server.begin();
-}
-
-// --------- ESP-NOW ----------
-void startEspNow() {
-  Serial.println("Starting ESP-NOW runtime");
-
-  prefs.begin("cfg", true);
-  myName = prefs.getString("name", "MagTag");
-  prefs.end();
-
-  WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
-    return;
+    markerExists = true; // Set marker for boot skipping
   }
-
-  Serial.println("ESP-NOW ready");
+  server.send(200, "text/html", buildSurveyPage()); // Serve HTML page
 }
 
 // --------- Setup ----------
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+
+  // Setup buttons
   pinMode(BUTTON_A, INPUT_PULLUP);
-  delay(400);
+  pinMode(BUTTON_B, INPUT_PULLUP);
+  pinMode(BUTTON_D, INPUT_PULLUP);
 
-  bool buttonHeld = digitalRead(BUTTON_A) == LOW;
-  bool serialConnected = Serial;
+  // Setup NeoPixels
+  pixels.begin();
+  pixels.setBrightness(40);
+  pixels.clear();
+  pixels.show();
 
-  prefs.begin("boot", false);
-  bool startEspNow = prefs.getBool("start_espnow", false);
-
-  if (buttonHeld || serialConnected) {
-    Serial.println("Maintenance override → survey");
-    prefs.putBool("start_espnow", false);
-    startEspNow = false;
+  // Load preferences
+  prefs.begin("cfg", true);
+  myName = prefs.getString("name", "MagTag");
+  espnowChannel = prefs.getInt("channel", 6);
+  for (int i = 0; i < MAX_INTERESTS; i++) {
+    String v = prefs.getString("interest" + String(i), "");
+    if (v.length() > 0) myInterests[interestCount++] = v;
   }
 
-  prefs.end();
+  // Check if survey already done
+  markerExists = prefs.getBool("marker", false);
 
-  if (startEspNow) {
-    surveyMode = false;
-    startEspNow();
-  } else {
-    surveyMode = true;
-    startSurvey();
+  if (!markerExists) {
+    // --------- RUN SURVEY ----------
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    WiFi.softAP("MagTag Survey"); // Start AP for survey
+
+    server.on("/", handleSurvey);
+    server.begin();
+
+    renderDisplay();
+    while (!surveyComplete) {      // Wait until survey completed
+      server.handleClient();       // Handle HTTP requests
+      renderDisplay();
+      delay(50);
+    }
+
+    // Save marker
+    prefs.begin("cfg", false);
+    prefs.putBool("marker", true);
+    prefs.end();
   }
+
+  // --------- RUN ESP-NOW ----------
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(espnowChannel, WIFI_SECOND_CHAN_NONE); // Set Wi-Fi channel
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive); // Register receive callback
+
+  // Setup broadcast peer
+  uint8_t broadcastMac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, broadcastMac, 6);
+  peer.channel = espnowChannel;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  renderDisplay(); // Initial display render
 }
 
 // --------- Loop ----------
+unsigned long lastBroadcast = 0;
 void loop() {
-  if (surveyMode && surveyComplete) {
-    delay(500);
-    ESP.restart();   // clean jump to ESP-NOW phase
+  // Periodic broadcast
+  if (millis() - lastBroadcast > BROADCAST_INTERVAL) {
+    String msg = buildMessage(); // Build message
+    esp_now_send((uint8_t*)"\xff\xff\xff\xff\xff\xff", (uint8_t*)msg.c_str(), msg.length()); // Broadcast
+    lastBroadcast = millis();
   }
 
-  // ESP-NOW main loop lives here
+  // Button A: toggle search/chat mode
+  if (!digitalRead(BUTTON_A)) {
+    currentMode = (currentMode == MODE_SEARCH) ? MODE_CHAT : MODE_SEARCH;
+    renderDisplay();
+    waitRelease(BUTTON_A);
+  }
+
+  // Button D: toggle badge display
+  if (!digitalRead(BUTTON_D)) {
+    badgeVisible = !badgeVisible;
+    renderDisplay();
+    waitRelease(BUTTON_D);
+  }
+
+  renderDisplay(); // Refresh display
+  delay(120);
 }
