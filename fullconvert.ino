@@ -1,15 +1,16 @@
-#include <WiFi.h>
-#include <esp_now.h>
-#include <Preferences.h>
-#include <Adafruit_ThinkInk.h>
-#include <Adafruit_NeoPixel.h>
-#include <WebServer.h>
+#include <WiFi.h>                 // For Wi-Fi connectivity
+#include <esp_now.h>              // For ESP-NOW communication
+#include <Preferences.h>          // For NVS storage
+#include <Adafruit_ThinkInk.h>    // For MagTag ThinkInk display
+#include <Adafruit_NeoPixel.h>    // For NeoPixel LED control
+#include <WebServer.h>            // For survey web page
 
 // --------- Pins ----------
-#define BUTTON_A 15
-#define BUTTON_B 14
-#define BUTTON_D 11
-#define NEOPIXEL_PIN 21
+#define BUTTON_MODE   15  // D15 - toggle search/chat mode
+#define BUTTON_SURVEY 14  // D14 - enter survey / pairing
+#define BUTTON_UNUSED 12  // D12 - reserved / optional
+#define BUTTON_BADGE  11  // D11 - toggle badge display
+#define NEOPIXEL_PIN  21  // NeoPixel data pin
 
 // --------- Constants ----------
 #define MAX_PEERS 32
@@ -20,14 +21,14 @@
 #define RSSI_BADGE_THRESHOLD -65
 #define SURVEY_PORT 80
 
-// MagTag 2.9" grayscale display pins
+// --------- Display pins (MagTag 2.9") ----------
 #define EPD_DC      7
 #define EPD_CS      8
 #define EPD_BUSY    -1
 #define SRAM_CS     -1
 #define EPD_RESET   6
 
-// Create ThinkInk display object
+// --------- Display object ----------
 ThinkInk_290_Grayscale4_EAAMFGN display(EPD_DC, EPD_RESET, EPD_CS, SRAM_CS, EPD_BUSY);
 
 // --------- LEDs ----------
@@ -61,10 +62,13 @@ int peerCount = 0;
 // --------- Web server ----------
 WebServer server(SURVEY_PORT);
 
-// --------- Marker for boot ----------
+// --------- Marker for survey ----------
+#define MARKER_KEY "marker"
 bool markerExists = false;
 
 // --------- Helpers ----------
+
+// Build ESP-NOW message
 String buildMessage() {
   String interests = "";
   for (int i = 0; i < interestCount; i++) {
@@ -75,9 +79,10 @@ String buildMessage() {
   return msg.substring(0, MAX_MSG_LEN);
 }
 
+// Flash NeoPixels for badge match
 void flashBadgeMatch() {
   for (int i = 0; i < 2; i++) {
-    pixels.fill(pixels.Color(0,80,80));
+    pixels.fill(pixels.Color(0, 80, 80));
     pixels.show();
     delay(80);
     pixels.clear();
@@ -86,14 +91,16 @@ void flashBadgeMatch() {
   }
 }
 
+// Wait for button release
 void waitRelease(int pin) {
   while (!digitalRead(pin)) delay(30);
 }
 
-// --------- ESP-NOW RX callback ----------
+// --------- ESP-NOW receive callback ----------
 void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   String msg = String((char*)data).substring(0, len);
   int rssi = info->rx_ctrl->rssi;
+
   bool found = false;
   for (int i = 0; i < peerCount; i++) {
     if (!memcmp(peers[i].mac, info->src_addr, 6)) {
@@ -103,38 +110,53 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       break;
     }
   }
+
   if (!found && peerCount < MAX_PEERS) {
     memcpy(peers[peerCount].mac, info->src_addr, 6);
     peers[peerCount].rssi = rssi;
     peers[peerCount].lastSeen = millis();
     peerCount++;
+
     if (rssi > RSSI_BADGE_THRESHOLD) flashBadgeMatch();
   }
 }
 
 // --------- Display ----------
+Mode lastMode = MODE_SEARCH;
+int lastPeerCount = -1;
+bool lastBadgeVisible = false;
+
 void renderDisplay() {
-  display.begin();
-  display.clearBuffer();
-  display.setTextColor(EPD_BLACK);
-  display.setCursor(4, 16);
-  display.print(currentMode == MODE_SEARCH ? "SEARCH" : "CHAT");
-  display.setCursor(4, 36);
-  display.print("Nearby: "); 
-  display.print(peerCount);
-  display.display();
+  if (currentMode != lastMode || peerCount != lastPeerCount || badgeVisible != lastBadgeVisible) {
+    display.begin();
+    display.clearBuffer();
+    display.setTextColor(EPD_BLACK);
+    display.setCursor(4, 16);
+    display.print(currentMode == MODE_SEARCH ? "SEARCH" : "CHAT");
+    display.setCursor(4, 36);
+    display.print("Nearby: ");
+    display.print(peerCount);
+    display.display();
+
+    lastMode = currentMode;
+    lastPeerCount = peerCount;
+    lastBadgeVisible = badgeVisible;
+  }
 }
 
-// --------- Survey Page ----------
+// --------- Survey page ----------
 String buildSurveyPage() {
-  String html = "<html><body><h2>Badge Setup</h2><form method='POST'>";
+  String html = "<html><body>";
+  html += "<h2>Badge Setup</h2>";
+  html += "<form method='POST'>";
   html += "Name: <input name='name' value='" + myName + "'><br>";
   for (int i = 0; i < MAX_INTERESTS; i++) {
     html += "<input type='text' name='interest" + String(i) + "' value='";
     if (i < interestCount) html += myInterests[i];
     html += "'><br>";
   }
-  html += "<input type='submit' value='Save'></form></body></html>";
+  html += "<input type='submit' value='Save'>";
+  html += "</form></body></html>";
   return html;
 }
 
@@ -146,13 +168,15 @@ void handleSurvey() {
       String val = server.arg("interest" + String(i));
       if (val.length() > 0) myInterests[interestCount++] = val;
     }
+
     prefs.begin("cfg", false);
-    prefs.putString("name", myName.c_str()); // FIX: convert key to const char*
+    prefs.putString("name", myName);
     for (int i = 0; i < interestCount; i++) {
-      String key = "interest" + String(i);
-      prefs.putString(key.c_str(), myInterests[i]); // FIX
+      prefs.putString("interest" + String(i), myInterests[i]);
     }
+    prefs.putBool(MARKER_KEY, true);
     prefs.end();
+
     surveyComplete = true;
     markerExists = true;
   }
@@ -164,9 +188,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(BUTTON_A, INPUT_PULLUP);
-  pinMode(BUTTON_B, INPUT_PULLUP);
-  pinMode(BUTTON_D, INPUT_PULLUP);
+  pinMode(BUTTON_MODE, INPUT_PULLUP);
+  pinMode(BUTTON_SURVEY, INPUT_PULLUP);
+  pinMode(BUTTON_UNUSED, INPUT_PULLUP);
+  pinMode(BUTTON_BADGE, INPUT_PULLUP);
 
   pixels.begin();
   pixels.setBrightness(40);
@@ -178,31 +203,31 @@ void setup() {
   myName = prefs.getString("name", "MagTag");
   espnowChannel = prefs.getInt("channel", 6);
   for (int i = 0; i < MAX_INTERESTS; i++) {
-    String v = prefs.getString(("interest" + String(i)).c_str(), "");
+    String v = prefs.getString("interest" + String(i), "");
     if (v.length() > 0) myInterests[interestCount++] = v;
   }
-  markerExists = prefs.getBool("marker", false);
-  prefs.end();
+  markerExists = prefs.getBool(MARKER_KEY, false);
 
-  if (!markerExists) {
+  // Survey mode
+  if (!markerExists || !digitalRead(BUTTON_SURVEY)) {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MagTag Survey");
+
     server.on("/", handleSurvey);
     server.begin();
+
     renderDisplay();
     while (!surveyComplete) {
       server.handleClient();
       renderDisplay();
       delay(50);
     }
-    prefs.begin("cfg", false);
-    prefs.putBool("marker", true);
-    prefs.end();
   }
 
-  // --------- ESP-NOW ----------
+  // ESP-NOW
   WiFi.mode(WIFI_STA);
-  WiFi.setChannel(espnowChannel); // FIX: Arduino ESP32
+  WiFi.disconnect();
+  WiFi.setChannel(espnowChannel);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
@@ -211,6 +236,7 @@ void setup() {
 
   esp_now_register_recv_cb(onReceive);
 
+  // Broadcast peer
   uint8_t broadcastMac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, broadcastMac, 6);
@@ -224,23 +250,24 @@ void setup() {
 // --------- Loop ----------
 unsigned long lastBroadcast = 0;
 void loop() {
+  // Periodic broadcast
   if (millis() - lastBroadcast > BROADCAST_INTERVAL) {
     String msg = buildMessage();
-    uint8_t broadcastMac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
-    esp_now_send(broadcastMac, (uint8_t*)msg.c_str(), msg.length());
+    esp_now_send((uint8_t*)"\xff\xff\xff\xff\xff\xff", (uint8_t*)msg.c_str(), msg.length());
     lastBroadcast = millis();
   }
 
-  if (!digitalRead(BUTTON_A)) {
+  // Buttons
+  if (!digitalRead(BUTTON_MODE)) {
     currentMode = (currentMode == MODE_SEARCH) ? MODE_CHAT : MODE_SEARCH;
     renderDisplay();
-    waitRelease(BUTTON_A);
+    waitRelease(BUTTON_MODE);
   }
 
-  if (!digitalRead(BUTTON_D)) {
+  if (!digitalRead(BUTTON_BADGE)) {
     badgeVisible = !badgeVisible;
     renderDisplay();
-    waitRelease(BUTTON_D);
+    waitRelease(BUTTON_BADGE);
   }
 
   renderDisplay();
