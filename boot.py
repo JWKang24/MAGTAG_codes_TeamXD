@@ -1,4 +1,3 @@
-storage.remount("/", not button.value)
 import storage
 import supervisor
 import board
