@@ -20,8 +20,13 @@
 #define RSSI_BADGE_THRESHOLD -65  // Minimum RSSI for badge alert
 #define SURVEY_PORT 80            // HTTP server port for survey
 
-// --------- Display ----------
-Adafruit_SSD1680 display(296, 128, -1, -1, -1, -1, -1); // E-Ink display object
+// MagTag 2.9" b/w display pins
+#define EPD_CS   10
+#define EPD_DC   9
+#define EPD_RST  6
+#define EPD_BUSY 5
+
+Adafruit_SSD1680 display(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY);
 
 // --------- LEDs ----------
 Adafruit_NeoPixel pixels(4, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800); // 4 NeoPixels
