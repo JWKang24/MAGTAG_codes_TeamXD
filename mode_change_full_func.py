@@ -1,5 +1,5 @@
-import supervisor
-supervisor.runtime.autoreload = False
+# import supervisor
+# supervisor.runtime.autoreload = False
 
 import time
 import os
@@ -583,7 +583,7 @@ def get_badge_interest_layout(interests):
     return 1, lines or ["(none)"]
 
 
-# -- Display (uses your working refresh pattern) --
+# -- Display --
 def render_display():
     global last_display_refresh, display_dirty
 
@@ -630,7 +630,6 @@ def render_display():
         scale=1,
     ))
 
-    search_large = (current_mode == MODE_SEARCH and not badge_visible)
     search_text_scale = 2 if current_mode == MODE_SEARCH else 1
 
     # status line
