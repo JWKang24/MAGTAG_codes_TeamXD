@@ -573,13 +573,12 @@ def get_badge_interest_layout(interests):
     if not items:
         return 1, ["(none)"]
 
-    for scale in (2, 1):
-        max_chars = 23 if scale == 2 else 46
-        lines = _pack_interest_lines(items, max_chars=max_chars, max_lines=2, truncate=False)
-        if lines is not None:
-            return scale, lines
+    # Big text only when a single short item is present.
+    if len(items) == 1 and len(items[0]) <= 20:
+        return 2, [items[0]]
 
-    lines = _pack_interest_lines(items, max_chars=46, max_lines=2, truncate=True)
+    # Otherwise use compact text and allow more wrapped content.
+    lines = _pack_interest_lines(items, max_chars=46, max_lines=3, truncate=True)
     return 1, lines or ["(none)"]
 
 
@@ -682,6 +681,11 @@ def render_display():
 
         if nearby_peers:
             max_peers = 2 if search_text_scale == 2 else 4
+            if badge_visible:
+                content_bottom = 76
+                row_step = 17 if search_text_scale == 2 else 11
+                room_rows = max(0, (content_bottom - y) // row_step)
+                max_peers = min(max_peers, room_rows)
             for _, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:max_peers]:
                 _, pct = compute_match(MY_INTERESTS, peer["interests"])
                 line = "{} {}% {}".format(
@@ -712,9 +716,13 @@ def render_display():
                 scale=1,
             ))
             badge_scale, badge_lines = get_badge_interest_layout(MY_INTERESTS)
-            line_step = 16 if badge_scale == 2 else 10
-            y_pos = 94
-            for row in badge_lines[:2]:
+            line_step = 16 if badge_scale == 2 else 9
+            y_pos = 96 if badge_scale == 2 else 92
+            max_bottom = 116
+            glyph_h = 8 * badge_scale
+            for row in badge_lines:
+                if y_pos + glyph_h > max_bottom:
+                    break
                 g.append(label.Label(
                     terminalio.FONT,
                     text=row,
