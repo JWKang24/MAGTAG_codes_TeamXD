@@ -1,15 +1,13 @@
-import storage
-import supervisor
+import time
 import board
 import digitalio
+import storage
 
-# Setup a physical override button (Button A)
+# Use front Button A (D15)
 button = digitalio.DigitalInOut(board.D15)
-button.direction = digitalio.Direction.INPUT
-button.pull = digitalio.Pull.UP
+button.switch_to_input(pull=digitalio.Pull.UP)
 
-# If Button A is held OR a laptop is detected, laptop gets write access.
-if not button.value or supervisor.runtime.serial_connected:
-    storage.remount("/", True)
-else:
-    storage.remount("/", False)
+time.sleep(0.5)
+
+# Button pressed (LOW) -> readonly=False, so CircuitPython can write settings.toml.
+storage.remount("/", readonly=button.value)
