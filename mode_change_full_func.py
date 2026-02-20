@@ -94,6 +94,7 @@ badge_visible = False
 last_broadcast = 0.0
 last_display_refresh = 0.0
 display_dirty = True
+chat_sync_refresh = False
 
 # Nearby peers
 nearby_peers = {}
@@ -186,6 +187,16 @@ def compute_match(mine, theirs):
         return [], 0
     pct = int((len(common) / total) * 100)
     return sorted(common), pct
+
+
+def topic_index(common_list, topic):
+    if (not common_list) or (not topic):
+        return None
+    t = topic.lower()
+    for i, item in enumerate(common_list):
+        if item.lower() == t:
+            return i
+    return None
 
 
 def first_common_interest(mine, theirs):
@@ -351,6 +362,13 @@ def do_broadcast():
         pass
     last_broadcast = time.monotonic()
 
+
+def do_broadcast_burst(count=2, gap_s=0.04):
+    # Send the same state twice to reduce one-packet-loss desync on topic step events.
+    for _ in range(count):
+        do_broadcast()
+        time.sleep(gap_s)
+
 def flash_new_peer():
     for _ in range(2):
         pixels.fill((0, 80, 80))
@@ -359,7 +377,7 @@ def flash_new_peer():
         time.sleep(0.08)
 
 def receive_all():
-    global display_dirty, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
+    global display_dirty, chat_sync_refresh, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
     global search_match_latched, search_match_topic, search_match_color
 
     changed = False
@@ -430,32 +448,39 @@ def receive_all():
         peer = nearby_peers.get(chat_peer_mac) if chat_peer_mac else None
         if peer:
             new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
-            peer_topic = peer.get("topic", "")
-            if (not chat_force_empty_topic) and peer_topic and peer_topic.lower() in set(s.lower() for s in MY_INTERESTS):
-                if not any(c.lower() == peer_topic.lower() for c in new_common):
-                    new_common = [peer_topic] + new_common
-                else:
-                    new_common = [c for c in new_common if c.lower() == peer_topic.lower()] + [
-                        c for c in new_common if c.lower() != peer_topic.lower()
-                    ]
             if new_common != chat_common:
+                old_topic = chat_common[chat_common_idx] if chat_common else ""
                 chat_common = new_common
-                if chat_common and chat_common_idx >= len(chat_common):
+                if chat_common:
+                    keep_idx = topic_index(chat_common, old_topic)
+                    if keep_idx is not None:
+                        chat_common_idx = keep_idx
+                    elif chat_common_idx >= len(chat_common):
+                        chat_common_idx = 0
+                else:
                     chat_common_idx = 0
                 changed = True
 
             peer_ver = peer.get("idx_ver", 0)
+            peer_idx = 0
+            if chat_common:
+                peer_idx = peer.get("common_idx", 0) % len(chat_common)
+                sync_idx = topic_index(chat_common, peer.get("topic", ""))
+                if sync_idx is not None:
+                    peer_idx = sync_idx
+
             if peer_ver > chat_idx_ver:
                 chat_idx_ver = peer_ver
-                chat_common_idx = (peer.get("common_idx", 0) % len(chat_common)) if chat_common else 0
-                changed = True
+                if chat_common_idx != peer_idx:
+                    chat_common_idx = peer_idx
+                    changed = True
+                    chat_sync_refresh = True
             elif peer_ver == chat_idx_ver:
                 if bytes(my_mac) > chat_peer_mac:
-                    peer_idx = peer.get("common_idx", 0)
-                    peer_idx = (peer_idx % len(chat_common)) if chat_common else 0
                     if peer_idx != chat_common_idx:
                         chat_common_idx = peer_idx
                         changed = True
+                        chat_sync_refresh = True
 
             if peer.get("contact_shared") and not contact_shared:
                 contact_shared = True
@@ -861,7 +886,7 @@ def render_display():
 
 # -- Mode transitions --
 def set_mode(new_mode, force_closest=False, force_empty_topic=False):
-    global current_mode, display_dirty
+    global current_mode, display_dirty, chat_sync_refresh
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared, chat_force_empty_topic
     global search_match_latched, search_match_topic, search_match_color
 
@@ -897,7 +922,11 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
 
             if best_mac is not None:
                 chat_peer_mac = best_mac
-                chat_common = [best_topic]
+                chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
+                chat_common_idx = 0
+                best_idx = topic_index(chat_common, best_topic)
+                if best_idx is not None:
+                    chat_common_idx = best_idx
             else:
                 if chat_peer_mac is None:
                     chat_peer_mac = pick_closest_peer()
@@ -915,6 +944,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         contact_shared = False
         chat_force_empty_topic = False
 
+    chat_sync_refresh = False
     current_mode = new_mode
 
     # Small LED blink on mode change
@@ -974,7 +1004,8 @@ try:
                     chat_common_idx = (chat_common_idx + 1) % len(chat_common)
                     chat_idx_ver += 1
                     display_dirty = True
-                    do_broadcast()
+                    chat_sync_refresh = True
+                    do_broadcast_burst()
                 pixels.fill((60, 60, 60))
                 time.sleep(0.12)
                 pixels.fill(0)
@@ -988,8 +1019,9 @@ try:
         receive_all()
 
         # Refresh display (rate-limited)
-        if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
+        if display_dirty and (chat_sync_refresh or (now - last_display_refresh >= DISPLAY_REFRESH)):
             render_display()
+            chat_sync_refresh = False
 
         # LEDs
         update_leds(phase)
