@@ -451,44 +451,57 @@ def receive_all():
                         chat_common_idx = 0
                 changed = True
 
-            peer_ver = peer.get("idx_ver", 0)
-            peer_topic = peer.get("topic", "")
-            peer_topic_idx = index_for_topic(chat_common, peer_topic)
-            if peer_ver > chat_idx_ver:
-                chat_idx_ver = peer_ver
-                if chat_common:
-                    if peer_topic_idx is not None:
-                        chat_common_idx = peer_topic_idx
-                    else:
-                        chat_common_idx = peer.get("common_idx", 0) % len(chat_common)
-                else:
-                    chat_common_idx = 0
-                changed = True
-            elif peer_ver == chat_idx_ver:
-                if bytes(my_mac) > chat_peer_mac:
+            # Only synchronize topic index/version with peers that are also in CHAT.
+            # SEARCH peers broadcast idx=0/topic="", which must not override our chat topic.
+            if peer.get("mode") == MODE_CHAT:
+                peer_ver = peer.get("idx_ver", 0)
+                peer_topic = peer.get("topic", "")
+                peer_topic_idx = index_for_topic(chat_common, peer_topic)
+                if peer_ver > chat_idx_ver:
+                    chat_idx_ver = peer_ver
                     if chat_common:
                         if peer_topic_idx is not None:
-                            peer_idx = peer_topic_idx
+                            chat_common_idx = peer_topic_idx
                         else:
-                            peer_idx = peer.get("common_idx", 0) % len(chat_common)
+                            chat_common_idx = peer.get("common_idx", 0) % len(chat_common)
                     else:
-                        peer_idx = 0
-                    if peer_idx != chat_common_idx:
-                        chat_common_idx = peer_idx
-                        changed = True
+                        chat_common_idx = 0
+                    changed = True
+                elif peer_ver == chat_idx_ver:
+                    if bytes(my_mac) > chat_peer_mac:
+                        if chat_common:
+                            if peer_topic_idx is not None:
+                                peer_idx = peer_topic_idx
+                            else:
+                                peer_idx = peer.get("common_idx", 0) % len(chat_common)
+                        else:
+                            peer_idx = 0
+                        if peer_idx != chat_common_idx:
+                            chat_common_idx = peer_idx
+                            changed = True
 
-            if peer.get("contact_shared") and not contact_shared:
-                contact_shared = True
-                changed = True
+                if peer.get("contact_shared") and not contact_shared:
+                    contact_shared = True
+                    changed = True
 
     else:
-        # Latch a match color in SEARCH mode and keep it until user enters CHAT.
-        if not search_match_latched:
-            matched_topic, _, _ = find_best_shared_match()
-            if matched_topic:
-                search_match_topic = matched_topic
-                search_match_color = interest_to_led_color(matched_topic)
-                search_match_latched = True
+        # Keep SEARCH display topic and SEARCH LED color sourced from the same live match.
+        matched_topic, _, _ = find_best_shared_match()
+        if matched_topic:
+            new_color = interest_to_led_color(matched_topic)
+            if (not search_match_latched or
+                    matched_topic.lower() != search_match_topic.lower() or
+                    new_color != search_match_color):
+                changed = True
+            search_match_topic = matched_topic
+            search_match_color = new_color
+            search_match_latched = True
+        else:
+            if search_match_latched or search_match_topic:
+                changed = True
+            search_match_latched = False
+            search_match_topic = ""
+            search_match_color = (0, 0, 0)
 
     if changed:
         display_dirty = True
@@ -524,11 +537,7 @@ def update_leds(phase):
             pixels.fill((0, br, 0))
     else:
         # In CHAT, keep LEDs solid in the shared-interest color.
-        topic = ""
-        if chat_common:
-            topic = chat_common[chat_common_idx]
-        elif search_match_topic:
-            topic = search_match_topic
+        topic = chat_common[chat_common_idx] if chat_common else ""
 
         if topic:
             pixels.fill(interest_to_led_color(topic))
@@ -665,24 +674,10 @@ def render_display():
     y = 50 if current_mode == MODE_SEARCH else 42
 
     if current_mode == MODE_SEARCH:
-        matched_topic = None
-        matched_rssi = -999
-        for _, peer in nearby_peers.items():
-            topic = ""
-            if peer.get("mode") == MODE_CHAT and peer.get("topic"):
-                peer_topic = peer.get("topic", "")
-                if any(peer_topic.lower() == mine.lower() for mine in MY_INTERESTS):
-                    topic = peer_topic
-            if not topic:
-                topic = first_common_interest(MY_INTERESTS, peer.get("interests", []))
-            if topic and peer.get("rssi", -999) > matched_rssi:
-                matched_topic = topic
-                matched_rssi = peer.get("rssi", -999)
-
-        if matched_topic:
+        if search_match_topic:
             g.append(label.Label(
                 terminalio.FONT,
-                text="Topic: " + matched_topic[:14 if search_text_scale == 2 else 30],
+                text="Topic: " + search_match_topic[:14 if search_text_scale == 2 else 30],
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
@@ -882,9 +877,11 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
 
     if new_mode == MODE_CHAT:
         # Preserve the currently latched SEARCH topic (if any) as preferred chat start.
-        preferred_topic = search_match_topic if search_match_latched else ""
+        preferred_topic = search_match_topic
         # Clear search-match latch once user chooses to move into chat.
         search_match_latched = False
+        search_match_topic = ""
+        search_match_color = (0, 0, 0)
         chat_force_empty_topic = force_empty_topic
         chat_common_idx = 0
         chat_idx_ver = 0
