@@ -36,6 +36,8 @@ def _parse_interests(csv_text):
 MY_NAME = _get_env_str("MY_NAME", "MagTag")
 MY_INTERESTS = _parse_interests(_get_env_str("MY_INTERESTS", "python,circuitpython"))
 ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
+RECENT_CHAT_PEERS_TOML = "/recent_chat_peers.toml"
+RECENT_CHAT_PEERS_KEY = "RECENT_CHATTED_MACS"
 
 # Timing
 BROADCAST_INTERVAL = 2.0
@@ -94,6 +96,7 @@ display_dirty = True
 
 # Nearby peers
 nearby_peers = {}
+blocked_auto_rematch_peers = set()
 
 # Chat state
 chat_peer_mac = None
@@ -204,12 +207,76 @@ def index_for_topic(common_list, topic):
     return None
 
 
+def _normalize_mac_hex(text):
+    value = (text or "").strip().lower().replace(":", "").replace("-", "")
+    if len(value) != 12:
+        return None
+    for ch in value:
+        if ch not in "0123456789abcdef":
+            return None
+    return value
+
+
+def _mac_bytes_to_hex(mac):
+    if isinstance(mac, (bytes, bytearray)) and len(mac) == 6:
+        return bytes(mac).hex()
+    return None
+
+
+def _load_recent_chat_peers():
+    peers = set()
+    try:
+        with open(RECENT_CHAT_PEERS_TOML, "r") as fp:
+            raw = fp.read()
+    except OSError:
+        _save_recent_chat_peers(set())
+        return peers
+
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith(RECENT_CHAT_PEERS_KEY):
+            continue
+        parts = line.split("=", 1)
+        if len(parts) != 2:
+            continue
+        value = parts[1].strip()
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            value = value[1:-1]
+        for item in value.split(","):
+            normalized = _normalize_mac_hex(item)
+            if normalized:
+                peers.add(bytes.fromhex(normalized))
+        break
+
+    return peers
+
+
+def _save_recent_chat_peers(peers):
+    macs = []
+    for mac in peers:
+        mac_hex = _mac_bytes_to_hex(mac)
+        if mac_hex:
+            macs.append(mac_hex)
+    macs.sort()
+
+    data = '{}="{}"\n'.format(RECENT_CHAT_PEERS_KEY, ",".join(macs))
+    try:
+        with open(RECENT_CHAT_PEERS_TOML, "w") as fp:
+            fp.write(data)
+    except Exception as ex:
+        print("WARN: cannot write {}: {}".format(RECENT_CHAT_PEERS_TOML, ex))
+
+
 def find_best_shared_match():
     """Return (topic, name, rssi) for best nearby shared-interest peer."""
     best_topic = None
     best_name = ""
     best_rssi = -999
-    for _, peer in nearby_peers.items():
+    for mac, peer in nearby_peers.items():
+        if mac in blocked_auto_rematch_peers:
+            continue
         topic = ""
         if peer.get("mode") == MODE_CHAT and peer.get("topic"):
             peer_topic = peer.get("topic", "")
@@ -425,6 +492,8 @@ def receive_all():
             best_mac = None
             best_rssi = -999
             for mac, candidate in nearby_peers.items():
+                if mac != chat_peer_mac and mac in blocked_auto_rematch_peers:
+                    continue
                 if candidate.get("mode") != MODE_CHAT:
                     continue
                 if candidate.get("topic", "").lower() != active_topic:
@@ -509,10 +578,12 @@ def receive_all():
 # -------------------------
 # Pick closest peer
 # -------------------------
-def pick_closest_peer():
+def pick_closest_peer(skip_blocked=False):
     best_mac = None
     best_rssi = -999
     for mac, peer in nearby_peers.items():
+        if skip_blocked and mac in blocked_auto_rematch_peers:
+            continue
         if peer["rssi"] > best_rssi:
             best_mac = mac
             best_rssi = peer["rssi"]
@@ -870,7 +941,7 @@ def render_display():
 def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared, chat_force_empty_topic
-    global search_match_latched, search_match_topic, search_match_color
+    global search_match_latched, search_match_topic, search_match_color, blocked_auto_rematch_peers
 
     if new_mode == current_mode:
         return
@@ -889,7 +960,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         chat_common = []
 
         if force_closest:
-            chat_peer_mac = pick_closest_peer()
+            chat_peer_mac = pick_closest_peer(skip_blocked=False)
             if chat_peer_mac and chat_peer_mac in nearby_peers:
                 chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
         else:
@@ -899,6 +970,8 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
             best_topic = None
             mine_lower = set(s.lower() for s in MY_INTERESTS)
             for mac, peer in nearby_peers.items():
+                if mac in blocked_auto_rematch_peers:
+                    continue
                 topic = peer.get("topic", "")
                 if peer.get("mode") == MODE_CHAT and topic and topic.lower() in mine_lower:
                     if peer["rssi"] > best_rssi:
@@ -911,7 +984,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
                 chat_common = [best_topic]
             else:
                 if chat_peer_mac is None:
-                    chat_peer_mac = pick_closest_peer()
+                    chat_peer_mac = pick_closest_peer(skip_blocked=True)
                 if chat_peer_mac and chat_peer_mac in nearby_peers:
                     chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
 
@@ -921,6 +994,13 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
             if preferred_idx is not None:
                 chat_common_idx = preferred_idx
     else:
+        if chat_peer_mac is not None:
+            peer_hex = _mac_bytes_to_hex(chat_peer_mac)
+            my_hex = _mac_bytes_to_hex(my_mac)
+            if peer_hex and peer_hex != my_hex and chat_peer_mac not in blocked_auto_rematch_peers:
+                blocked_auto_rematch_peers.add(chat_peer_mac)
+                _save_recent_chat_peers(blocked_auto_rematch_peers)
+
         # Fresh search session starts with no latched match color.
         search_match_latched = False
         search_match_topic = ""
@@ -941,6 +1021,8 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
 
     display_dirty = True
     do_broadcast()
+
+blocked_auto_rematch_peers = _load_recent_chat_peers()
 
 # ===== MAIN LOOP =====
 try:
