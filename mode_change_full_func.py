@@ -8,7 +8,6 @@ import digitalio
 import espnow
 import wifi
 from adafruit_display_text import label
-import maintenance_mode
 
 # ---------------------------
 # Load settings.toml config
@@ -37,8 +36,10 @@ def _parse_interests(csv_text):
 MY_NAME = _get_env_str("MY_NAME", "MagTag")
 MY_INTERESTS = _parse_interests(_get_env_str("MY_INTERESTS", "python,circuitpython"))
 ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
+ESPNOW_PEER_CHANNEL = _get_env_int("ESPNOW_PEER_CHANNEL", 0)
 RECENT_CHAT_PEERS_TOML = "/recent_chat_peers.toml"
 RECENT_CHAT_PEERS_KEY = "RECENT_CHATTED_MACS"
+DEBUG_ESPNOW = (_get_env_int("DEBUG_ESPNOW", 0) != 0)
 
 # Timing
 BROADCAST_INTERVAL = 2.0
@@ -83,7 +84,7 @@ wifi.radio.stop_ap()
 
 BROADCAST_MAC = b"\xff\xff\xff\xff\xff\xff"
 e = espnow.ESPNow(buffer_size=1024)
-broadcast_peer = espnow.Peer(mac=BROADCAST_MAC, channel=ESPNOW_CHANNEL)
+broadcast_peer = espnow.Peer(mac=BROADCAST_MAC, channel=ESPNOW_PEER_CHANNEL)
 e.peers.append(broadcast_peer)
 
 my_mac = wifi.radio.mac_address
@@ -94,6 +95,11 @@ badge_visible = False
 last_broadcast = 0.0
 last_display_refresh = 0.0
 display_dirty = True
+last_debug_log = 0.0
+tx_attempts = 0
+tx_errors = 0
+rx_packets = 0
+parse_failures = 0
 
 # Nearby peers
 nearby_peers = {}
@@ -443,12 +449,15 @@ def is_shared_interest_peer(peer_info):
 # Broadcast / receive
 # -------------------------
 def do_broadcast():
-    global last_broadcast
+    global last_broadcast, tx_attempts, tx_errors
     msg = build_message()
+    tx_attempts += 1
     try:
         e.send(bytes(msg, "utf-8"), broadcast_peer)
-    except Exception:
-        pass
+    except Exception as ex:
+        tx_errors += 1
+        if DEBUG_ESPNOW:
+            print("ESPNOW TX error:", ex)
     last_broadcast = time.monotonic()
 
 def flash_new_peer():
@@ -461,6 +470,7 @@ def flash_new_peer():
 def receive_all():
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
     global search_match_latched, search_match_topic, search_match_color
+    global rx_packets, parse_failures
 
     changed = False
     now = time.monotonic()
@@ -469,9 +479,11 @@ def receive_all():
         packet = e.read()
         if packet is None:
             break
+        rx_packets += 1
 
         info = parse_message(packet.msg)
         if info is None:
+            parse_failures += 1
             continue
 
         mac_key = bytes(packet.mac)
@@ -1051,6 +1063,12 @@ blocked_auto_rematch_peers = _load_recent_chat_peers()
 
 # ===== MAIN LOOP =====
 try:
+    if DEBUG_ESPNOW:
+        print(
+            "ESPNOW cfg channel=", ESPNOW_CHANNEL,
+            "peer_channel=", ESPNOW_PEER_CHANNEL,
+            "mac=", bytes(my_mac).hex()
+        )
     render_display()
     do_broadcast()
 
@@ -1110,6 +1128,25 @@ try:
 
         # Receive
         receive_all()
+
+        if DEBUG_ESPNOW and (now - last_debug_log >= 5.0):
+            channel_text = "?"
+            try:
+                channel_text = str(wifi.radio.ap_info.channel)
+            except Exception:
+                pass
+            print(
+                "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={}".format(
+                    MODE_NAMES[current_mode],
+                    channel_text,
+                    tx_attempts,
+                    tx_errors,
+                    rx_packets,
+                    parse_failures,
+                    len(nearby_peers),
+                )
+            )
+            last_debug_log = now
 
         # Refresh display (rate-limited)
         if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
