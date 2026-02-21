@@ -8,6 +8,7 @@ import digitalio
 import espnow
 import wifi
 from adafruit_display_text import label
+import maintenance_mode
 
 # ---------------------------
 # Load settings.toml config
@@ -223,6 +224,18 @@ def _mac_bytes_to_hex(mac):
     return None
 
 
+def _is_blocked_peer_mac(mac):
+    if mac in blocked_auto_rematch_peers:
+        return True
+    mac_hex = _mac_bytes_to_hex(mac)
+    if not mac_hex:
+        return False
+    for blocked_mac in blocked_auto_rematch_peers:
+        if _mac_bytes_to_hex(blocked_mac) == mac_hex:
+            return True
+    return False
+
+
 def _load_recent_chat_peers():
     peers = set()
     try:
@@ -290,6 +303,11 @@ def find_best_shared_match():
             best_name = peer.get("name", "")
             best_rssi = rssi
     return best_topic, best_name, best_rssi
+
+
+def has_live_shared_match():
+    topic, _, _ = find_best_shared_match()
+    return bool(topic)
 
 
 def interest_to_led_color(topic):
@@ -393,6 +411,8 @@ def check_badge_matches(packet_mac, peer_info):
     global seen_badge_devices
     if packet_mac == bytes(my_mac):
         return
+    if packet_mac in blocked_auto_rematch_peers:
+        return
     if packet_mac in seen_badge_devices:
         return
     rssi = peer_info.get("rssi", -100)
@@ -414,6 +434,11 @@ def check_badge_matches(packet_mac, peer_info):
         )
         flash_alert(color)
         seen_badge_devices.add(packet_mac)
+
+
+def is_shared_interest_peer(peer_info):
+    peer_interests = peer_info.get("interests", [])
+    return first_common_interest(MY_INTERESTS, peer_interests) is not None
 # -------------------------
 # Broadcast / receive
 # -------------------------
@@ -453,6 +478,7 @@ def receive_all():
         if mac_key == bytes(my_mac):
             continue
 
+        is_blocked_peer = _is_blocked_peer_mac(mac_key)
         old = nearby_peers.get(mac_key)
         nearby_peers[mac_key] = {
             "name": info["name"],
@@ -468,11 +494,13 @@ def receive_all():
         }
 
         # --- badge match alert ---
-        check_badge_matches(mac_key, nearby_peers[mac_key])
+        if not is_blocked_peer:
+            check_badge_matches(mac_key, nearby_peers[mac_key])
 
         if old is None:
             changed = True
-            flash_new_peer()
+            if (not is_blocked_peer) and is_shared_interest_peer(nearby_peers[mac_key]):
+                flash_new_peer()
         else:
             if (old["mode"] != info["mode"] or
                 old["name"] != info["name"] or
@@ -596,16 +624,13 @@ def pick_closest_peer(skip_blocked=False):
 def update_leds(phase):
     r, g, b = MODE_COLORS[current_mode]
     if current_mode == MODE_SEARCH:
-        if search_match_latched:
+        if search_match_latched and search_match_topic and has_live_shared_match():
             # Matched peer found: flash latched topic color until user enters CHAT.
             on = ((phase // 5) % 2) == 0
             pixels.fill(search_match_color if on else (0, 0, 0))
         else:
-            n = len(nearby_peers)
-            speed = max(20, 40 - n * 4)
-            scale = abs((phase % speed) - speed // 2) / (speed / 2.0)
-            br = int(g * (0.3 + 0.7 * scale))
-            pixels.fill((0, br, 0))
+            # No active match: keep a steady search color (no flashing).
+            pixels.fill((0, 12, 0))
     else:
         # In CHAT, keep LEDs solid in the shared-interest color.
         topic = chat_common[chat_common_idx] if chat_common else ""
