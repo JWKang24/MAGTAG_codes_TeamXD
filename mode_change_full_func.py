@@ -1,6 +1,3 @@
-# import supervisor
-# supervisor.runtime.autoreload = False
-
 import time
 import os
 import board
@@ -94,7 +91,6 @@ badge_visible = False
 last_broadcast = 0.0
 last_display_refresh = 0.0
 display_dirty = True
-chat_sync_refresh = False
 
 # Nearby peers
 nearby_peers = {}
@@ -189,21 +185,22 @@ def compute_match(mine, theirs):
     return sorted(common), pct
 
 
-def topic_index(common_list, topic):
-    if (not common_list) or (not topic):
-        return None
-    t = topic.lower()
-    for i, item in enumerate(common_list):
-        if item.lower() == t:
-            return i
-    return None
-
-
 def first_common_interest(mine, theirs):
     theirs_set = set(s.lower() for s in theirs)
     for item in mine:
         if item.lower() in theirs_set:
             return item
+    return None
+
+
+def index_for_topic(common_list, topic):
+    """Return index of topic in common_list (case-insensitive), or None."""
+    if not common_list or not topic:
+        return None
+    t = topic.lower()
+    for i, item in enumerate(common_list):
+        if item.lower() == t:
+            return i
     return None
 
 
@@ -362,13 +359,6 @@ def do_broadcast():
         pass
     last_broadcast = time.monotonic()
 
-
-def do_broadcast_burst(count=2, gap_s=0.04):
-    # Send the same state twice to reduce one-packet-loss desync on topic step events.
-    for _ in range(count):
-        do_broadcast()
-        time.sleep(gap_s)
-
 def flash_new_peer():
     for _ in range(2):
         pixels.fill((0, 80, 80))
@@ -377,7 +367,7 @@ def flash_new_peer():
         time.sleep(0.08)
 
 def receive_all():
-    global display_dirty, chat_sync_refresh, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
+    global display_dirty, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
     global search_match_latched, search_match_topic, search_match_color
 
     changed = False
@@ -449,38 +439,43 @@ def receive_all():
         if peer:
             new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
             if new_common != chat_common:
-                old_topic = chat_common[chat_common_idx] if chat_common else ""
+                prior_topic = chat_common[chat_common_idx] if chat_common else ""
                 chat_common = new_common
-                if chat_common:
-                    keep_idx = topic_index(chat_common, old_topic)
-                    if keep_idx is not None:
-                        chat_common_idx = keep_idx
+                if not chat_common:
+                    chat_common_idx = 0
+                else:
+                    mapped_idx = index_for_topic(chat_common, prior_topic)
+                    if mapped_idx is not None:
+                        chat_common_idx = mapped_idx
                     elif chat_common_idx >= len(chat_common):
                         chat_common_idx = 0
-                else:
-                    chat_common_idx = 0
                 changed = True
 
             peer_ver = peer.get("idx_ver", 0)
-            peer_idx = 0
-            if chat_common:
-                peer_idx = peer.get("common_idx", 0) % len(chat_common)
-                sync_idx = topic_index(chat_common, peer.get("topic", ""))
-                if sync_idx is not None:
-                    peer_idx = sync_idx
-
+            peer_topic = peer.get("topic", "")
+            peer_topic_idx = index_for_topic(chat_common, peer_topic)
             if peer_ver > chat_idx_ver:
                 chat_idx_ver = peer_ver
-                if chat_common_idx != peer_idx:
-                    chat_common_idx = peer_idx
-                    changed = True
-                    chat_sync_refresh = True
+                if chat_common:
+                    if peer_topic_idx is not None:
+                        chat_common_idx = peer_topic_idx
+                    else:
+                        chat_common_idx = peer.get("common_idx", 0) % len(chat_common)
+                else:
+                    chat_common_idx = 0
+                changed = True
             elif peer_ver == chat_idx_ver:
                 if bytes(my_mac) > chat_peer_mac:
+                    if chat_common:
+                        if peer_topic_idx is not None:
+                            peer_idx = peer_topic_idx
+                        else:
+                            peer_idx = peer.get("common_idx", 0) % len(chat_common)
+                    else:
+                        peer_idx = 0
                     if peer_idx != chat_common_idx:
                         chat_common_idx = peer_idx
                         changed = True
-                        chat_sync_refresh = True
 
             if peer.get("contact_shared") and not contact_shared:
                 contact_shared = True
@@ -598,12 +593,13 @@ def get_badge_interest_layout(interests):
     if not items:
         return 1, ["(none)"]
 
-    # Big text only when a single short item is present.
-    if len(items) == 1 and len(items[0]) <= 20:
-        return 2, [items[0]]
+    for scale in (2, 1):
+        max_chars = 23 if scale == 2 else 46
+        lines = _pack_interest_lines(items, max_chars=max_chars, max_lines=2, truncate=False)
+        if lines is not None:
+            return scale, lines
 
-    # Otherwise use compact text and allow more wrapped content.
-    lines = _pack_interest_lines(items, max_chars=46, max_lines=3, truncate=True)
+    lines = _pack_interest_lines(items, max_chars=46, max_lines=2, truncate=True)
     return 1, lines or ["(none)"]
 
 
@@ -706,11 +702,6 @@ def render_display():
 
         if nearby_peers:
             max_peers = 2 if search_text_scale == 2 else 4
-            if badge_visible:
-                content_bottom = 76
-                row_step = 17 if search_text_scale == 2 else 11
-                room_rows = max(0, (content_bottom - y) // row_step)
-                max_peers = min(max_peers, room_rows)
             for _, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:max_peers]:
                 _, pct = compute_match(MY_INTERESTS, peer["interests"])
                 line = "{} {}% {}".format(
@@ -741,13 +732,9 @@ def render_display():
                 scale=1,
             ))
             badge_scale, badge_lines = get_badge_interest_layout(MY_INTERESTS)
-            line_step = 16 if badge_scale == 2 else 9
-            y_pos = 96 if badge_scale == 2 else 92
-            max_bottom = 116
-            glyph_h = 8 * badge_scale
-            for row in badge_lines:
-                if y_pos + glyph_h > max_bottom:
-                    break
+            line_step = 16 if badge_scale == 2 else 10
+            y_pos = 94
+            for row in badge_lines[:2]:
                 g.append(label.Label(
                     terminalio.FONT,
                     text=row,
@@ -886,7 +873,7 @@ def render_display():
 
 # -- Mode transitions --
 def set_mode(new_mode, force_closest=False, force_empty_topic=False):
-    global current_mode, display_dirty, chat_sync_refresh
+    global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared, chat_force_empty_topic
     global search_match_latched, search_match_topic, search_match_color
 
@@ -894,6 +881,8 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         return
 
     if new_mode == MODE_CHAT:
+        # Preserve the currently latched SEARCH topic (if any) as preferred chat start.
+        preferred_topic = search_match_topic if search_match_latched else ""
         # Clear search-match latch once user chooses to move into chat.
         search_match_latched = False
         chat_force_empty_topic = force_empty_topic
@@ -922,16 +911,18 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
 
             if best_mac is not None:
                 chat_peer_mac = best_mac
-                chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
-                chat_common_idx = 0
-                best_idx = topic_index(chat_common, best_topic)
-                if best_idx is not None:
-                    chat_common_idx = best_idx
+                chat_common = [best_topic]
             else:
                 if chat_peer_mac is None:
                     chat_peer_mac = pick_closest_peer()
                 if chat_peer_mac and chat_peer_mac in nearby_peers:
                     chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
+
+        # If SEARCH had a matched topic, start CHAT on that same topic when possible.
+        if chat_common and preferred_topic:
+            preferred_idx = index_for_topic(chat_common, preferred_topic)
+            if preferred_idx is not None:
+                chat_common_idx = preferred_idx
     else:
         # Fresh search session starts with no latched match color.
         search_match_latched = False
@@ -944,7 +935,6 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         contact_shared = False
         chat_force_empty_topic = False
 
-    chat_sync_refresh = False
     current_mode = new_mode
 
     # Small LED blink on mode change
@@ -1004,8 +994,7 @@ try:
                     chat_common_idx = (chat_common_idx + 1) % len(chat_common)
                     chat_idx_ver += 1
                     display_dirty = True
-                    chat_sync_refresh = True
-                    do_broadcast_burst()
+                    do_broadcast()
                 pixels.fill((60, 60, 60))
                 time.sleep(0.12)
                 pixels.fill(0)
@@ -1019,9 +1008,8 @@ try:
         receive_all()
 
         # Refresh display (rate-limited)
-        if display_dirty and (chat_sync_refresh or (now - last_display_refresh >= DISPLAY_REFRESH)):
+        if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
             render_display()
-            chat_sync_refresh = False
 
         # LEDs
         update_leds(phase)

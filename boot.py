@@ -2,12 +2,18 @@ import time
 import board
 import digitalio
 import storage
+import supervisor
 
-# Use front Button A (D15)
-button = digitalio.DigitalInOut(board.D15)
-button.switch_to_input(pull=digitalio.Pull.UP)
+supervisor.runtime.autoreload = False
 
-time.sleep(0.5)
+btn = digitalio.DigitalInOut(board.D15)  # Button A on MagTag
+btn.direction = digitalio.Direction.INPUT
+btn.pull = digitalio.Pull.UP
 
-# Button pressed (LOW) -> readonly=False, so CircuitPython can write settings.toml.
-storage.remount("/", readonly=button.value)
+time.sleep(0.05)
+
+if btn.value:  # Not pressed → lock USB drive
+    storage.disable_usb_drive()
+else:
+    # Button held → allow USB drive
+    pass
