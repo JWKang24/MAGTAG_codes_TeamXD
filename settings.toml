@@ -1,4 +1,4 @@
-MY_NAME = "test"
+MY_NAME = "default"
 MY_INTERESTS = "github, python, wearables, circuitpython, pc"
 ESPNOW_CHANNEL = 6
 CIRCUITPY_WIFI_SSID = "LocalTestWiFi"

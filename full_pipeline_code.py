@@ -5,6 +5,7 @@ import supervisor
 supervisor.runtime.autoreload = False
 
 _MARKER = "/.start_espnow"
+_DEFAULT_NAME = "default"
 
 
 def _marker_exists():
@@ -27,16 +28,25 @@ def _clear_marker():
         pass
 
 
+def _should_run_survey():
+    current_name = (os.getenv("MY_NAME") or "").strip()
+    return (not current_name) or (current_name == _DEFAULT_NAME)
+
+
 if _marker_exists():
     # Phase 2: fresh boot into ESP-NOW runtime.
     _clear_marker()
     import mode_change_full_func
 else:
-    # Phase 1: run survey. After completion, force a clean reload.
-    import user_survey
-    try:
-        _write_marker()
-        supervisor.reload()
-    except Exception:
-        # Fallback if marker write/reload fails.
+    if _should_run_survey():
+        # Phase 1: run survey. After completion, force a clean reload.
+        import user_survey
+        try:
+            _write_marker()
+            supervisor.reload()
+        except Exception:
+            # Fallback if marker write/reload fails.
+            import mode_change_full_func
+    else:
+        # Name is already customized; skip survey and run ESP-NOW runtime.
         import mode_change_full_func
