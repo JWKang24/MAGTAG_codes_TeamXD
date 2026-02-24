@@ -23,6 +23,35 @@ def html_escape(text):
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def interest_label(text):
+    label = (text or "").replace("_", " ").strip().lower()
+    if not label:
+        return ""
+    words = [w for w in label.split(" ") if w]
+    return " ".join(w[0].upper() + w[1:] for w in words)
+
+
+def build_interest_lookup(interests):
+    lookup = {}
+    for raw in interests:
+        base = (raw or "").strip()
+        if not base:
+            continue
+        variants = (
+            base,
+            base.lower(),
+            base.replace("_", " "),
+            base.lower().replace("_", " "),
+            base.replace("-", " "),
+            base.lower().replace("-", " "),
+        )
+        for item in variants:
+            key = item.strip().lower()
+            if key and key not in lookup:
+                lookup[key] = base
+    return lookup
+
+
 def toml_escape(text):
     return (text or "").replace("\\", "\\\\").replace('"', '\\"')
 
@@ -182,12 +211,13 @@ def build_form_page(name, current_hobbies, message=""):
 
     for interest in ALL_INTERESTS:
         checked = "checked" if interest in current_hobbies else ""
+        display_label = interest_label(interest)
         html += """
 <label>
   <input type="checkbox" name="badge" value="{}" {}>
   {}
 </label><br>
-""".format(html_escape(interest), checked, html_escape(interest))
+""".format(html_escape(interest), checked, html_escape(display_label))
 
     html += """
 <br>
@@ -259,11 +289,13 @@ def index(request: Request):
         if not isinstance(selected, list):
             selected = [selected] if selected else []
 
-        allowed = set(ALL_INTERESTS)
+        allowed_lookup = build_interest_lookup(ALL_INTERESTS)
         filtered = []
         for x in selected:
-            if x in allowed and x not in filtered:
-                filtered.append(x)
+            key = (x or "").strip().lower()
+            canonical = allowed_lookup.get(key)
+            if canonical and canonical not in filtered:
+                filtered.append(canonical)
         filtered = filtered[:MAX_INTERESTS]
 
         try:
