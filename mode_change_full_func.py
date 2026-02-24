@@ -751,11 +751,19 @@ def rssi_bar(rssi):
     return "*"
 
 
+def _display_interest_text(text):
+    value = (text or "").replace("_", " ").strip().lower()
+    if not value:
+        return ""
+    words = [w for w in value.split(" ") if w]
+    return " ".join(w[0].upper() + w[1:] for w in words)
+
+
 def _pack_interest_lines(interests, max_chars, max_lines=2, truncate=False):
     lines = []
     current = ""
     for raw in interests:
-        item = (raw or "").strip()
+        item = _display_interest_text(raw)
         if not item:
             continue
         if len(item) > max_chars:
@@ -794,7 +802,7 @@ def _pack_interest_lines(interests, max_chars, max_lines=2, truncate=False):
 def get_badge_interest_layout(interests):
     items = [s for s in interests[:8] if s and s.strip()]
     if not items:
-        return 1, ["(none)"]
+        return 1, ["(None)"]
 
     for scale in (2, 1):
         max_chars = 23 if scale == 2 else 46
@@ -803,7 +811,7 @@ def get_badge_interest_layout(interests):
             return scale, lines
 
     lines = _pack_interest_lines(items, max_chars=46, max_lines=2, truncate=True)
-    return 1, lines or ["(none)"]
+    return 1, lines or ["(None)"]
 
 
 # -- Display --
@@ -869,9 +877,10 @@ def render_display():
 
     if current_mode == MODE_SEARCH:
         if search_match_topic:
+            topic_text = _display_interest_text(search_match_topic)
             g.append(label.Label(
                 terminalio.FONT,
-                text="Topic: " + search_match_topic[:14 if search_text_scale == 2 else 30],
+                text="Topic: " + topic_text[:14 if search_text_scale == 2 else 30],
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
@@ -943,7 +952,7 @@ def render_display():
         ))
 
     else:
-        peer_name = "(none)"
+        peer_name = "(None)"
         peer_rssi = None
         peer_in_chat = False
         if chat_peer_mac and chat_peer_mac in nearby_peers:
@@ -973,14 +982,15 @@ def render_display():
             y += 12
 
         topic = chat_common[chat_common_idx] if (chat_common and peer_in_chat) else ""
+        topic_text = _display_interest_text(topic)
         idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common)) if chat_common else ""
         image_path = _topic_to_image_path(topic)
         image_drawn = False
 
-        if topic:
+        if topic_text:
             g.append(label.Label(
                 terminalio.FONT,
-                text="Topic: " + topic[:20],
+                text="Topic: " + topic_text[:20],
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
@@ -1013,7 +1023,7 @@ def render_display():
 
         if not image_drawn:
             if peer_in_chat:
-                fallback = "Common: " + topic if topic else "Common: (none)"
+                fallback = "Common: " + topic_text if topic_text else "Common: (None)"
             else:
                 fallback = "Waiting for peer chat..."
             g.append(label.Label(
@@ -1037,7 +1047,7 @@ def render_display():
                 ))
                 y += 12
 
-        share_text = "Contact shared: YES" if contact_shared else "Contact shared: no"
+        share_text = "Contact Shared: Yes" if contact_shared else "Contact Shared: No"
         g.append(label.Label(
             terminalio.FONT,
             text=share_text,
