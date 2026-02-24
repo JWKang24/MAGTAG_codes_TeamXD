@@ -46,6 +46,9 @@ BROADCAST_INTERVAL = 2.0
 PEER_TIMEOUT = 15.0
 DISPLAY_REFRESH = 8.0
 MAX_MSG_LEN = 250
+CHAT_HANDSHAKE_TIMEOUT = 10.0
+AUTO_RECONNECT_DELAY = 60.0
+AUTO_RECONNECT_DELAY_EXTENDED = 300.0
 
 # -- Modes --
 MODE_SEARCH = 0
@@ -112,6 +115,12 @@ chat_common_idx = 0
 chat_idx_ver = 0
 contact_shared = False
 chat_force_empty_topic = False
+chat_wait_peer_mac = None
+chat_wait_deadline = 0.0
+
+# Auto-rematch state per recent peer (keyed by MAC hex).
+# stage 0: initial 60s delay, stage 1: extended 5 min delay
+auto_rematch_state = {}
 
 # Search-mode match LED latch state
 search_match_latched = False
@@ -231,15 +240,80 @@ def _mac_bytes_to_hex(mac):
 
 
 def _is_blocked_peer_mac(mac):
-    if mac in blocked_auto_rematch_peers:
+    mac_hex = _mac_bytes_to_hex(mac)
+    if (not mac_hex) or (mac_hex == _mac_bytes_to_hex(my_mac)):
+        return False
+    state = auto_rematch_state.get(mac_hex)
+    if state is None:
+        return False
+
+    now = time.monotonic()
+    unblock_at = state.get("unblock_at", 0.0)
+    stage = state.get("stage", 0)
+
+    if now < unblock_at:
         return True
+
+    if stage == 0:
+        attempted = bool(state.get("attempted_chat", False))
+        if attempted:
+            # At least one side tried CHAT during the first 60s window.
+            # Allow automatic reconnect now.
+            try:
+                del auto_rematch_state[mac_hex]
+            except KeyError:
+                pass
+            return False
+
+        # No CHAT attempt during first 60s -> extend auto reconnect delay by 5 min.
+        state["stage"] = 1
+        state["unblock_at"] = now + AUTO_RECONNECT_DELAY_EXTENDED
+        auto_rematch_state[mac_hex] = state
+        return True
+
+    # Extended delay has elapsed; allow auto reconnect again.
+    try:
+        del auto_rematch_state[mac_hex]
+    except KeyError:
+        pass
+    return False
+
+
+def _start_auto_rematch_block(mac, attempted_chat=False):
+    mac_hex = _mac_bytes_to_hex(mac)
+    my_hex = _mac_bytes_to_hex(my_mac)
+    if (not mac_hex) or (mac_hex == my_hex):
+        return
+
+    auto_rematch_state[mac_hex] = {
+        "stage": 0,
+        "unblock_at": time.monotonic() + AUTO_RECONNECT_DELAY,
+        "attempted_chat": bool(attempted_chat),
+    }
+
+    # Persist as a recently chatted peer record.
+    blocked_auto_rematch_peers.add(bytes.fromhex(mac_hex))
+    _save_recent_chat_peers(blocked_auto_rematch_peers)
+
+
+def _mark_chat_handshake_success(mac):
     mac_hex = _mac_bytes_to_hex(mac)
     if not mac_hex:
-        return False
-    for blocked_mac in blocked_auto_rematch_peers:
-        if _mac_bytes_to_hex(blocked_mac) == mac_hex:
-            return True
-    return False
+        return
+    if mac_hex in auto_rematch_state:
+        del auto_rematch_state[mac_hex]
+
+
+def _mark_chat_attempt(mac):
+    mac_hex = _mac_bytes_to_hex(mac)
+    if not mac_hex:
+        return
+    state = auto_rematch_state.get(mac_hex)
+    if state is None:
+        return
+    if state.get("stage", 0) == 0:
+        state["attempted_chat"] = True
+        auto_rematch_state[mac_hex] = state
 
 
 def _load_recent_chat_peers():
@@ -294,7 +368,7 @@ def find_best_shared_match():
     best_name = ""
     best_rssi = -999
     for mac, peer in nearby_peers.items():
-        if mac in blocked_auto_rematch_peers:
+        if _is_blocked_peer_mac(mac):
             continue
         topic = ""
         if peer.get("mode") == MODE_CHAT and peer.get("topic"):
@@ -417,7 +491,7 @@ def check_badge_matches(packet_mac, peer_info):
     global seen_badge_devices
     if packet_mac == bytes(my_mac):
         return
-    if packet_mac in blocked_auto_rematch_peers:
+    if _is_blocked_peer_mac(packet_mac):
         return
     if packet_mac in seen_badge_devices:
         return
@@ -470,6 +544,7 @@ def flash_new_peer():
 def receive_all():
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, contact_shared, chat_idx_ver
     global search_match_latched, search_match_topic, search_match_color
+    global chat_wait_peer_mac, chat_wait_deadline
     global rx_packets, parse_failures
 
     changed = False
@@ -518,6 +593,13 @@ def receive_all():
                 old["name"] != info["name"] or
                 old["topic"] != info["topic"]):
                 changed = True
+            # Peer timed out/exited CHAT that was targeting us:
+            # mirror cooldown on this badge so SEARCH match notice clears too.
+            if (old.get("mode") == MODE_CHAT and
+                    info["mode"] == MODE_SEARCH and
+                    old.get("peer_mac") == bytes(my_mac)):
+                _start_auto_rematch_block(mac_key, attempted_chat=True)
+                changed = True
 
     # prune stale
     stale = [k for k, v in nearby_peers.items() if now - v["last_seen"] > PEER_TIMEOUT]
@@ -532,7 +614,7 @@ def receive_all():
             best_mac = None
             best_rssi = -999
             for mac, candidate in nearby_peers.items():
-                if mac != chat_peer_mac and mac in blocked_auto_rematch_peers:
+                if mac != chat_peer_mac and _is_blocked_peer_mac(mac):
                     continue
                 if candidate.get("mode") != MODE_CHAT:
                     continue
@@ -563,6 +645,10 @@ def receive_all():
             # Only synchronize topic index/version with peers that are also in CHAT.
             # SEARCH peers broadcast idx=0/topic="", which must not override our chat topic.
             if peer.get("mode") == MODE_CHAT:
+                if chat_peer_mac:
+                    _mark_chat_handshake_success(chat_peer_mac)
+                    if chat_wait_peer_mac == chat_peer_mac:
+                        chat_wait_deadline = 0.0
                 peer_ver = peer.get("idx_ver", 0)
                 peer_topic = peer.get("topic", "")
                 peer_topic_idx = index_for_topic(chat_common, peer_topic)
@@ -622,7 +708,7 @@ def pick_closest_peer(skip_blocked=False):
     best_mac = None
     best_rssi = -999
     for mac, peer in nearby_peers.items():
-        if skip_blocked and mac in blocked_auto_rematch_peers:
+        if skip_blocked and _is_blocked_peer_mac(mac):
             continue
         if peer["rssi"] > best_rssi:
             best_mac = mac
@@ -859,9 +945,11 @@ def render_display():
     else:
         peer_name = "(none)"
         peer_rssi = None
+        peer_in_chat = False
         if chat_peer_mac and chat_peer_mac in nearby_peers:
             peer_name = nearby_peers[chat_peer_mac]["name"][:16]
             peer_rssi = nearby_peers[chat_peer_mac]["rssi"]
+            peer_in_chat = (nearby_peers[chat_peer_mac].get("mode") == MODE_CHAT)
 
         g.append(label.Label(
             terminalio.FONT,
@@ -884,7 +972,7 @@ def render_display():
             ))
             y += 12
 
-        topic = chat_common[chat_common_idx] if chat_common else ""
+        topic = chat_common[chat_common_idx] if (chat_common and peer_in_chat) else ""
         idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common)) if chat_common else ""
         image_path = _topic_to_image_path(topic)
         image_drawn = False
@@ -924,7 +1012,10 @@ def render_display():
                 image_drawn = False
 
         if not image_drawn:
-            fallback = "Common: " + topic if topic else "Common: (none)"
+            if peer_in_chat:
+                fallback = "Common: " + topic if topic else "Common: (none)"
+            else:
+                fallback = "Waiting for peer chat..."
             g.append(label.Label(
                 terminalio.FONT,
                 text=fallback[:32],
@@ -978,12 +1069,15 @@ def render_display():
 def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, contact_shared, chat_force_empty_topic
+    global chat_wait_peer_mac, chat_wait_deadline
     global search_match_latched, search_match_topic, search_match_color, blocked_auto_rematch_peers
 
     if new_mode == current_mode:
         return
 
     if new_mode == MODE_CHAT:
+        chat_wait_deadline = time.monotonic() + CHAT_HANDSHAKE_TIMEOUT
+        chat_wait_peer_mac = None
         # Preserve the currently latched SEARCH topic (if any) as preferred chat start.
         preferred_topic = search_match_topic
         # Clear search-match latch once user chooses to move into chat.
@@ -1007,7 +1101,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
             best_topic = None
             mine_lower = set(s.lower() for s in MY_INTERESTS)
             for mac, peer in nearby_peers.items():
-                if mac in blocked_auto_rematch_peers:
+                if _is_blocked_peer_mac(mac):
                     continue
                 topic = peer.get("topic", "")
                 if peer.get("mode") == MODE_CHAT and topic and topic.lower() in mine_lower:
@@ -1030,13 +1124,16 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
             preferred_idx = index_for_topic(chat_common, preferred_topic)
             if preferred_idx is not None:
                 chat_common_idx = preferred_idx
+
+        if chat_peer_mac is not None:
+            _mark_chat_attempt(chat_peer_mac)
+            chat_wait_peer_mac = chat_peer_mac
+        else:
+            # Keep the button-press timeout active even if peer selection is pending.
+            chat_wait_peer_mac = None
     else:
         if chat_peer_mac is not None:
-            peer_hex = _mac_bytes_to_hex(chat_peer_mac)
-            my_hex = _mac_bytes_to_hex(my_mac)
-            if peer_hex and peer_hex != my_hex and chat_peer_mac not in blocked_auto_rematch_peers:
-                blocked_auto_rematch_peers.add(chat_peer_mac)
-                _save_recent_chat_peers(blocked_auto_rematch_peers)
+            _start_auto_rematch_block(chat_peer_mac, attempted_chat=True)
 
         # Fresh search session starts with no latched match color.
         search_match_latched = False
@@ -1048,6 +1145,8 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         chat_idx_ver = 0
         contact_shared = False
         chat_force_empty_topic = False
+        chat_wait_peer_mac = None
+        chat_wait_deadline = 0.0
 
     current_mode = new_mode
 
@@ -1129,6 +1228,16 @@ try:
         # Receive
         receive_all()
 
+        # CHAT handshake timeout:
+        # if peer never enters CHAT within 10s, return to SEARCH.
+        if current_mode == MODE_CHAT and chat_wait_deadline > 0.0:
+            if now >= chat_wait_deadline:
+                peer = nearby_peers.get(chat_wait_peer_mac) if chat_wait_peer_mac else None
+                if (not peer) or (peer.get("mode") != MODE_CHAT):
+                    set_mode(MODE_SEARCH)
+                    continue
+                chat_wait_deadline = 0.0
+
         if DEBUG_ESPNOW and (now - last_debug_log >= 5.0):
             channel_text = "?"
             try:
@@ -1136,7 +1245,7 @@ try:
             except Exception:
                 pass
             print(
-                "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={}".format(
+                "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={} blocked_active={}".format(
                     MODE_NAMES[current_mode],
                     channel_text,
                     tx_attempts,
@@ -1144,6 +1253,7 @@ try:
                     rx_packets,
                     parse_failures,
                     len(nearby_peers),
+                    len(auto_rematch_state),
                 )
             )
             last_debug_log = now
