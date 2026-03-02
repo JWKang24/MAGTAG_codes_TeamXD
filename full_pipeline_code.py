@@ -36,7 +36,7 @@ def _should_run_survey():
 if _marker_exists():
     # Phase 2: fresh boot into ESP-NOW runtime.
     _clear_marker()
-    import mode_change_full_func
+    import mode_change_one_button
 else:
     if _should_run_survey():
         # Phase 1: run survey. After completion, force a clean reload.
@@ -46,7 +46,7 @@ else:
             supervisor.reload()
         except Exception:
             # Fallback if marker write/reload fails.
-            import mode_change_full_func
+            import mode_change_one_button
     else:
         # Name is already customized; skip survey and run ESP-NOW runtime.
-        import mode_change_full_func
+        import mode_change_one_button
