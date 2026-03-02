@@ -1,5 +1,6 @@
-code.py
+./code.py
 __pycache__/
 *.pyc
 *.pyo
 impl_reqs/
+settings.toml
