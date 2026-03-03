@@ -44,7 +44,7 @@ def _get_env_bool(key, default=True):
     return _get_env_int(key, d) != 0
 
 MY_NAME = _get_env_str("MY_NAME", "MagTag")
-MY_INTERESTS = []
+MY_INTERESTS = _get_env_str("MY_INTERESTS", "")
 ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
 ESPNOW_PEER_CHANNEL = _get_env_int("ESPNOW_PEER_CHANNEL", 0)
 RECENT_CHAT_PEERS_TOML = "/recent_chat_peers.toml"
@@ -56,10 +56,12 @@ MATCH_ENABLE_SERVER = _get_env_bool("MATCH_ENABLE_SERVER", True)
 MATCH_SERVER_BASE_URL = _get_env_str("MATCH_SERVER_BASE_URL", "")
 MATCH_SERVER_APP_KEY = _get_env_str("MATCH_SERVER_APP_KEY", "")
 MATCH_HTTP_TIMEOUT_S = _get_env_float("MATCH_HTTP_TIMEOUT_S", 2.0)
-MATCH_OBSERVE_INTERVAL_S = _get_env_float("MATCH_OBSERVE_INTERVAL_S", 2.0)
+MATCH_OBSERVE_INTERVAL_S = _get_env_float("MATCH_OBSERVE_INTERVAL_S", 1.0)
 MATCH_REQUEST_INTERVAL_S = _get_env_float("MATCH_REQUEST_INTERVAL_S", 3.0)
 MATCH_ERROR_BACKOFF_S = _get_env_float("MATCH_ERROR_BACKOFF_S", 8.0)
 MATCH_RSSI_RECHECK_DELTA = _get_env_int("MATCH_RSSI_RECHECK_DELTA", 8)
+WIFI_SSID = _get_env_str("CIRCUITPY_WIFI_SSID", "")
+WIFI_PASSWORD = _get_env_str("CIRCUITPY_WIFI_PASSWORD", "")
 
 # Timing
 BROADCAST_INTERVAL = 2.0
@@ -145,6 +147,7 @@ server_client = None
 server_enabled = False
 server_auth_failed = False
 next_observe_sync = 0.0
+self_interest_synced = False
 
 # Chat state
 chat_peer_mac = None
@@ -164,7 +167,8 @@ auto_rematch_state = {}
 
 # Search-mode match LED latch state
 search_match_latched = False
-search_match_topic = ""
+search_match_peer_mac = None
+search_match_peer_name = ""
 search_match_color = (0, 0, 0)
 
 # -- Badge match alert state --
@@ -187,10 +191,17 @@ def build_message():
             topic_str = chat_common[chat_common_idx][:30]
         if isinstance(chat_peer_mac, (bytes, bytearray)):
             peer_mac_hex = chat_peer_mac.hex()
+            if _peer_is_server_match(chat_peer_mac):
+                shared_flag = "1"
         else:
             peer_mac_hex = ""
         idx_str = str(chat_common_idx)
         ver_str = str(chat_idx_ver)
+    else:
+        target_peer = _pick_best_server_match_peer()
+        if isinstance(target_peer, (bytes, bytearray)):
+            peer_mac_hex = target_peer.hex()
+            shared_flag = "1"
 
     parts = [
         str(current_mode),
@@ -216,6 +227,7 @@ def parse_message(data):
         interests = [s.strip() for s in parts[2].split(",") if s.strip()]
         topic = parts[3].strip()
         peer_mac = bytes.fromhex(parts[4]) if parts[4] else None
+        shared_flag = (parts[5].strip() == "1")
         common_idx = int(parts[6]) if parts[6] else 0
         idx_ver = int(parts[7]) if parts[7] else 0
         return {
@@ -224,30 +236,12 @@ def parse_message(data):
             "interests": interests,
             "topic": topic,
             "peer_mac": peer_mac,
+            "shared_flag": shared_flag,
             "common_idx": common_idx,
             "idx_ver": idx_ver,
         }
     except Exception:
         return None
-
-def compute_match(mine, theirs):
-    mine_set = set(s.lower() for s in mine)
-    theirs_set = set(s.lower() for s in theirs)
-    common = mine_set & theirs_set
-    total = len(mine_set | theirs_set)
-    if total == 0:
-        return [], 0
-    pct = int((len(common) / total) * 100)
-    return sorted(common), pct
-
-
-def first_common_interest(mine, theirs):
-    theirs_set = set(s.lower() for s in theirs)
-    for item in mine:
-        if item.lower() in theirs_set:
-            return item
-    return None
-
 
 def index_for_topic(common_list, topic):
     """Return index of topic in common_list (case-insensitive), or None."""
@@ -280,35 +274,7 @@ def _is_blocked_peer_mac(mac):
     mac_hex = _mac_bytes_to_hex(mac)
     if (not mac_hex) or (mac_hex == _mac_bytes_to_hex(my_mac)):
         return False
-    if bytes.fromhex(mac_hex) in blocked_auto_rematch_peers:
-        return True
-
-    state = auto_rematch_state.get(mac_hex)
-    if state is None:
-        return False
-
-    now = time.monotonic()
-    cooldown_until = state.get("cooldown_until", 0.0)
-    if cooldown_until and now < cooldown_until:
-        return True
-
-    if cooldown_until and now >= cooldown_until:
-        del auto_rematch_state[mac_hex]
-        return False
-
-    window_deadline = state.get("window_deadline", 0.0)
-    if window_deadline and now >= window_deadline:
-        if state.get("had_chat_attempt", False):
-            del auto_rematch_state[mac_hex]
-            return False
-
-        # Case 2: shared match existed for 60s without a successful joint chat.
-        state["window_deadline"] = 0.0
-        state["cooldown_until"] = now + AUTO_RECONNECT_DELAY_EXTENDED
-        auto_rematch_state[mac_hex] = state
-        return True
-
-    return False
+    return bytes.fromhex(mac_hex) in blocked_auto_rematch_peers
 
 
 def _track_match_window(mac, peer_info):
@@ -417,56 +383,64 @@ def _save_recent_chat_peers(peers):
     except Exception as ex:
         print("WARN: cannot write {}: {}".format(RECENT_CHAT_PEERS_TOML, ex))
 
+def _peer_confidence(mac):
+    state = _get_peer_server_state(mac, create=False) or {}
+    conf = state.get("confidence")
+    if conf is None:
+        return 0.0
+    try:
+        return float(conf)
+    except Exception:
+        return 0.0
 
 
-def find_best_shared_match():
-    """Return (topic, name, rssi) for best nearby server-approved peer."""
-    best_topic = None
-    best_name = ""
-    best_rssi = -999
+def _pick_best_server_match_peer(require_peer_targets_me=False):
+    best_mac = None
     best_conf = -1.0
+    best_mac_hex = None
+    my_mac_bytes = bytes(my_mac)
+
     for mac, peer in nearby_peers.items():
+        if mac == my_mac_bytes:
+            continue
         if _is_blocked_peer_mac(mac):
             continue
         if not _peer_is_server_match(mac):
             continue
+        if require_peer_targets_me:
+            if not peer.get("shared_flag"):
+                continue
+            if peer.get("peer_mac") != my_mac_bytes:
+                continue
 
-        state = _get_peer_server_state(mac, create=False) or {}
-        conf = state.get("confidence")
-        if conf is None:
-            conf = 0.0
-
-        topic = ""
-        if peer.get("mode") == MODE_CHAT and peer.get("topic"):
-            topic = peer.get("topic", "")
-        if not topic:
-            topic = "Conversation"
-
-        rssi = peer.get("rssi", -999)
-        if (conf > best_conf) or (conf == best_conf and rssi > best_rssi):
-            best_topic = topic
-            best_name = peer.get("name", "")
-            best_rssi = rssi
+        conf = _peer_confidence(mac)
+        mac_hex = _mac_bytes_to_hex(mac) or ""
+        if (
+            best_mac is None
+            or conf > best_conf
+            or (conf == best_conf and mac_hex < best_mac_hex)
+        ):
+            best_mac = mac
             best_conf = conf
+            best_mac_hex = mac_hex
 
-    return best_topic, best_name, best_rssi
-
-
-def has_live_shared_match():
-    topic, _, _ = find_best_shared_match()
-    return bool(topic)
+    return best_mac
 
 
-def interest_to_led_color(topic):
-    """
-    Deterministically map a shared-interest topic to a visible LED color.
-    Same topic -> same color across devices.
-    """
-    if not topic:
+def _pair_led_color(mac_a, mac_b):
+    mac_a_hex = _mac_bytes_to_hex(mac_a)
+    mac_b_hex = _mac_bytes_to_hex(mac_b)
+    if (not mac_a_hex) or (not mac_b_hex):
         return (0, 80, 80)
+
+    if mac_a_hex > mac_b_hex:
+        mac_a_hex, mac_b_hex = mac_b_hex, mac_a_hex
+
+    pair_key = "{}:{}".format(mac_a_hex, mac_b_hex)
     h = 0
-    for ch in topic.lower():
+    for ch in pair_key:
         h = ((h * 33) + ord(ch)) & 0xFFFF
+
     palette = (
         (120, 30, 30),
         (30, 120, 30),
@@ -620,7 +594,7 @@ def flash_new_peer():
 
 def receive_all():
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver
-    global search_match_latched, search_match_topic, search_match_color
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
     global rx_packets, parse_failures
 
@@ -651,6 +625,7 @@ def receive_all():
             "rssi": packet.rssi,
             "last_seen": now,
             "peer_mac": info["peer_mac"],
+            "shared_flag": info["shared_flag"],
             "common_idx": info["common_idx"],
             "idx_ver": info["idx_ver"],
         }
@@ -668,7 +643,9 @@ def receive_all():
         else:
             if (old["mode"] != info["mode"] or
                 old["name"] != info["name"] or
-                old["topic"] != info["topic"]):
+                old["topic"] != info["topic"] or
+                old.get("peer_mac") != info["peer_mac"] or
+                old.get("shared_flag") != info["shared_flag"]):
                 changed = True
             # Peer timed out/exited CHAT that was targeting us:
             # mirror cooldown on this badge so SEARCH match notice clears too.
@@ -687,94 +664,50 @@ def receive_all():
         changed = True
 
     if current_mode == MODE_CHAT:
-        # Follow the strongest broadcaster in the same active topic to allow open join.
-        if (not chat_force_empty_topic) and chat_common:
-            active_topic = chat_common[chat_common_idx].lower()
-            best_mac = None
-            best_rssi = -999
-            for mac, candidate in nearby_peers.items():
-                if mac != chat_peer_mac and _is_blocked_peer_mac(mac):
-                    continue
-                if candidate.get("mode") != MODE_CHAT:
-                    continue
-                if candidate.get("topic", "").lower() != active_topic:
-                    continue
-                if candidate["rssi"] > best_rssi:
-                    best_mac = mac
-                    best_rssi = candidate["rssi"]
-            if best_mac is not None:
-                chat_peer_mac = best_mac
-
         peer = nearby_peers.get(chat_peer_mac) if chat_peer_mac else None
         if peer:
-            new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
-            if (not new_common) and chat_peer_mac and _peer_is_server_match(chat_peer_mac):
+            if chat_force_empty_topic:
+                new_common = []
+            else:
                 new_common = ["Conversation"]
             if new_common != chat_common:
-                prior_topic = chat_common[chat_common_idx] if chat_common else ""
                 chat_common = new_common
                 if not chat_common:
                     chat_common_idx = 0
-                else:
-                    mapped_idx = index_for_topic(chat_common, prior_topic)
-                    if mapped_idx is not None:
-                        chat_common_idx = mapped_idx
-                    elif chat_common_idx >= len(chat_common):
-                        chat_common_idx = 0
                 changed = True
 
-            # Only synchronize topic index/version with peers that are also in CHAT.
-            # SEARCH peers broadcast idx=0/topic="", which must not override our chat topic.
-            if peer.get("mode") == MODE_CHAT:
+            peer_in_chat = (peer.get("mode") == MODE_CHAT)
+            if peer_in_chat:
                 if chat_peer_mac:
                     _mark_chat_handshake_success(chat_peer_mac)
-                    if chat_wait_peer_mac == chat_peer_mac:
+                    if (
+                        chat_wait_peer_mac == chat_peer_mac and
+                        peer.get("peer_mac") == bytes(my_mac)
+                    ):
                         chat_wait_deadline = 0.0
-                    if chat_peer_exit_deadline > 0.0:
+                    if chat_peer_exit_deadline > 0.0 and peer.get("peer_mac") == bytes(my_mac):
                         chat_peer_exit_deadline = 0.0
-                peer_ver = peer.get("idx_ver", 0)
-                peer_topic = peer.get("topic", "")
-                peer_topic_idx = index_for_topic(chat_common, peer_topic)
-                if peer_ver > chat_idx_ver:
-                    chat_idx_ver = peer_ver
-                    if chat_common:
-                        if peer_topic_idx is not None:
-                            chat_common_idx = peer_topic_idx
-                        else:
-                            chat_common_idx = peer.get("common_idx", 0) % len(chat_common)
-                    else:
-                        chat_common_idx = 0
-                    changed = True
-                elif peer_ver == chat_idx_ver:
-                    if bytes(my_mac) > chat_peer_mac:
-                        if chat_common:
-                            if peer_topic_idx is not None:
-                                peer_idx = peer_topic_idx
-                            else:
-                                peer_idx = peer.get("common_idx", 0) % len(chat_common)
-                        else:
-                            peer_idx = 0
-                        if peer_idx != chat_common_idx:
-                            chat_common_idx = peer_idx
-                            changed = True
 
     else:
-        # Keep SEARCH display topic and SEARCH LED color sourced from the same live match.
-        matched_topic, _, _ = find_best_shared_match()
-        if matched_topic:
-            new_color = interest_to_led_color(matched_topic)
+        best_mac = _pick_best_server_match_peer()
+        if best_mac is not None:
+            best_peer_name = nearby_peers.get(best_mac, {}).get("name", "")
+            new_color = _pair_led_color(bytes(my_mac), best_mac)
             if (not search_match_latched or
-                    matched_topic.lower() != search_match_topic.lower() or
+                    best_mac != search_match_peer_mac or
+                    best_peer_name != search_match_peer_name or
                     new_color != search_match_color):
                 changed = True
-            search_match_topic = matched_topic
+            search_match_peer_mac = best_mac
+            search_match_peer_name = best_peer_name
             search_match_color = new_color
             search_match_latched = True
         else:
-            if search_match_latched or search_match_topic:
+            if search_match_latched or search_match_peer_mac:
                 changed = True
             search_match_latched = False
-            search_match_topic = ""
+            search_match_peer_mac = None
+            search_match_peer_name = ""
             search_match_color = (0, 0, 0)
 
     if changed:
@@ -801,19 +734,20 @@ def pick_closest_peer(skip_blocked=False):
 def update_leds(phase):
     r, g, b = MODE_COLORS[current_mode]
     if current_mode == MODE_SEARCH:
-        if search_match_latched and search_match_topic and has_live_shared_match():
-            # Matched peer found: flash latched topic color until user enters CHAT.
+        if (
+            search_match_latched and
+            search_match_peer_mac is not None and
+            _peer_is_server_match(search_match_peer_mac)
+        ):
+            # Matched peer found: root-pattern flash cadence.
             on = ((phase // 5) % 2) == 0
             pixels.fill(search_match_color if on else (0, 0, 0))
         else:
             # No active match: keep a steady search color (no flashing).
             pixels.fill((0, 12, 0))
     else:
-        # In CHAT, keep LEDs solid in the shared-interest color.
-        topic = chat_common[chat_common_idx] if chat_common else ""
-
-        if topic:
-            pixels.fill(interest_to_led_color(topic))
+        if chat_peer_mac is not None and _peer_is_server_match(chat_peer_mac):
+            pixels.fill(_pair_led_color(bytes(my_mac), chat_peer_mac))
         else:
             idx = (phase // 5) % 4
             pixels.fill((5, 4, 0))
@@ -955,11 +889,10 @@ def render_display():
     y = 50 if current_mode == MODE_SEARCH else 42
 
     if current_mode == MODE_SEARCH:
-        if search_match_topic:
-            topic_text = _display_interest_text(search_match_topic)
+        if search_match_peer_name:
             g.append(label.Label(
                 terminalio.FONT,
-                text="Topic: " + topic_text[:14 if search_text_scale == 2 else 30],
+                text="Match: " + search_match_peer_name[:14 if search_text_scale == 2 else 30],
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
@@ -1012,7 +945,10 @@ def render_display():
         if chat_peer_mac and chat_peer_mac in nearby_peers:
             peer_name = nearby_peers[chat_peer_mac]["name"][:16]
             peer_rssi = nearby_peers[chat_peer_mac]["rssi"]
-            peer_in_chat = (nearby_peers[chat_peer_mac].get("mode") == MODE_CHAT)
+            peer_in_chat = (
+                nearby_peers[chat_peer_mac].get("mode") == MODE_CHAT and
+                nearby_peers[chat_peer_mac].get("peer_mac") == bytes(my_mac)
+            )
 
         g.append(label.Label(
             terminalio.FONT,
@@ -1077,9 +1013,9 @@ def render_display():
 
         if not image_drawn:
             if peer_in_chat:
-                fallback = "Common: " + topic_text if topic_text else "Common: (None)"
+                fallback = "Conversation"
             else:
-                fallback = "Waiting for peer chat..."
+                fallback = "Waiting: peer press A"
             g.append(label.Label(
                 terminalio.FONT,
                 text=fallback[:32],
@@ -1124,79 +1060,49 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, chat_force_empty_topic
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
-    global search_match_latched, search_match_topic, search_match_color, blocked_auto_rematch_peers
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
+    global blocked_auto_rematch_peers
 
     if new_mode == current_mode:
         return
 
     if new_mode == MODE_CHAT:
+        if force_closest:
+            selected_peer = pick_closest_peer(skip_blocked=False)
+        else:
+            selected_peer = _pick_best_server_match_peer(require_peer_targets_me=True)
+            if selected_peer is None:
+                selected_peer = _pick_best_server_match_peer()
+
+        if selected_peer is None:
+            return
+
         chat_wait_deadline = time.monotonic() + CHAT_HANDSHAKE_TIMEOUT
-        chat_wait_peer_mac = None
+        chat_wait_peer_mac = selected_peer
         chat_peer_exit_deadline = 0.0
-        # Preserve the currently latched SEARCH topic (if any) as preferred chat start.
-        preferred_topic = search_match_topic
-        # Clear search-match latch once user chooses to move into chat.
+
         search_match_latched = False
-        search_match_topic = ""
+        search_match_peer_mac = None
+        search_match_peer_name = ""
         search_match_color = (0, 0, 0)
+
+        chat_peer_mac = selected_peer
         chat_force_empty_topic = force_empty_topic
         chat_common_idx = 0
         chat_idx_ver = 0
-        chat_common = []
-
-        if force_closest:
-            chat_peer_mac = pick_closest_peer(skip_blocked=False)
-            if chat_peer_mac and chat_peer_mac in nearby_peers:
-                chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
-                if (not chat_common) and _peer_is_server_match(chat_peer_mac):
-                    chat_common = ["Conversation"]
+        if chat_force_empty_topic:
+            chat_common = []
         else:
-            # Prefer joining an ongoing chat from server-approved peers.
-            best_mac = None
-            best_rssi = -999
-            best_topic = None
-            for mac, peer in nearby_peers.items():
-                if _is_blocked_peer_mac(mac):
-                    continue
-                if not _peer_is_server_match(mac):
-                    continue
-                topic = peer.get("topic", "")
-                if peer.get("mode") == MODE_CHAT:
-                    if peer["rssi"] > best_rssi:
-                        best_mac = mac
-                        best_rssi = peer["rssi"]
-                        best_topic = topic or "Conversation"
-
-            if best_mac is not None:
-                chat_peer_mac = best_mac
-                chat_common = [best_topic]
-            else:
-                if chat_peer_mac is None:
-                    chat_peer_mac = pick_closest_peer(skip_blocked=True)
-                if chat_peer_mac and chat_peer_mac in nearby_peers:
-                    chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
-                    if (not chat_common) and _peer_is_server_match(chat_peer_mac):
-                        chat_common = ["Conversation"]
-
-        # If SEARCH had a matched topic, start CHAT on that same topic when possible.
-        if chat_common and preferred_topic:
-            preferred_idx = index_for_topic(chat_common, preferred_topic)
-            if preferred_idx is not None:
-                chat_common_idx = preferred_idx
-
-        if chat_peer_mac is not None:
-            _mark_chat_attempt(chat_peer_mac)
-            chat_wait_peer_mac = chat_peer_mac
-        else:
-            # Keep the button-press timeout active even if peer selection is pending.
-            chat_wait_peer_mac = None
+            chat_common = ["Conversation"]
+        _mark_chat_attempt(chat_peer_mac)
     else:
         if chat_peer_mac is not None:
             _start_auto_rematch_block(chat_peer_mac, AUTO_RECONNECT_DELAY)
 
         # Fresh search session starts with no latched match color.
         search_match_latched = False
-        search_match_topic = ""
+        search_match_peer_mac = None
+        search_match_peer_name = ""
         search_match_color = (0, 0, 0)
         chat_peer_mac = None
         chat_common = []
@@ -1254,20 +1160,18 @@ def _peer_is_server_match(mac):
 def _peer_status_text(mac):
     state = _get_peer_server_state(mac, create=False)
     if not state:
-        return "PEND"
+        return "WAIT"
     decision = state.get("decision")
     if decision is True:
         conf = state.get("confidence")
         if conf is None:
-            return "MATCH"
-        return "M{}".format(int(max(0, min(99, conf * 100.0))))
+            return "YES"
+        return "{}%".format(int(max(0, min(99, conf * 100.0))))
     if decision is False:
         return "NO"
-    if state.get("source") == "proximity_gate":
-        return "GATE"
     if state.get("last_error"):
         return "ERR"
-    return "PEND"
+    return "WAIT"
 
 
 def _sync_local_gate_cache():
@@ -1279,6 +1183,23 @@ def _sync_local_gate_cache():
     for mac, _peer in nearby_peers.items():
         state = _get_peer_server_state(mac, create=True)
         state["local_gate"] = True
+
+
+def _ensure_wifi_connected():
+    try:
+        if wifi.radio.ipv4_address:
+            return True
+    except Exception:
+        pass
+
+    if (not WIFI_SSID) or (not WIFI_PASSWORD):
+        return False
+
+    try:
+        wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
+        return bool(wifi.radio.ipv4_address)
+    except Exception:
+        return False
 
 
 def _initialize_server_client(now):
@@ -1310,6 +1231,11 @@ def _initialize_server_client(now):
         server_enabled = False
         return
 
+    if not _ensure_wifi_connected():
+        print("SERVER disabled: Wi-Fi station not connected")
+        server_enabled = False
+        return
+
     try:
         server_client = server_match_client.ServerMatchClient(
             base_url=MATCH_SERVER_BASE_URL,
@@ -1318,6 +1244,7 @@ def _initialize_server_client(now):
         )
         server_enabled = True
         next_observe_sync = now
+        _sync_self_interest()
         print("SERVER enabled base_url={} device_id={}".format(MATCH_SERVER_BASE_URL, MY_DEVICE_ID))
     except Exception as ex:
         server_client = None
@@ -1331,6 +1258,28 @@ def _mark_server_error(result):
     if code == "UNAUTHORIZED":
         server_auth_failed = True
     return code
+
+
+def _sync_self_interest():
+    global self_interest_synced
+
+    if self_interest_synced or (not server_enabled) or server_auth_failed or server_client is None:
+        return
+
+    interest_blurb = (MY_INTERESTS or "").strip()
+    if not interest_blurb:
+        self_interest_synced = True
+        return
+
+    result = server_client.put_interest(MY_DEVICE_ID, interest_blurb)
+    if result.get("ok"):
+        self_interest_synced = True
+        print("SERVER self-interest synced")
+        return
+
+    code = _mark_server_error(result)
+    print("SERVER self-interest sync failed code={}".format(code or "UNKNOWN"))
+    self_interest_synced = True
 
 
 def _sync_server_observations(now):
@@ -1481,6 +1430,10 @@ try:
         # Receive
         receive_all()
 
+        # LEDs first so HTTP timing has less impact on perceived blink cadence.
+        update_leds(phase)
+        phase = (phase + 1) % 200
+
         _sync_local_gate_cache()
         _sync_server_observations(now)
         _sync_server_matches(now)
@@ -1490,7 +1443,10 @@ try:
         if current_mode == MODE_CHAT and chat_wait_deadline > 0.0:
             if now >= chat_wait_deadline:
                 peer = nearby_peers.get(chat_wait_peer_mac) if chat_wait_peer_mac else None
-                if (not peer) or (peer.get("mode") != MODE_CHAT):
+                if (
+                    (not peer)
+                    or (peer.get("mode") != MODE_CHAT)
+                ):
                     set_mode(MODE_SEARCH)
                     continue
                 chat_wait_deadline = 0.0
@@ -1525,10 +1481,6 @@ try:
         # Refresh display (rate-limited)
         if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
             render_display()
-
-        # LEDs
-        update_leds(phase)
-        phase = (phase + 1) % 200
 
         time.sleep(0.08)
 
