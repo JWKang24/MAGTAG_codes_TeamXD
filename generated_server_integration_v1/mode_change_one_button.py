@@ -4,7 +4,7 @@ import board
 import displayio
 import terminalio
 import neopixel
-import digitalio
+import keypad
 import espnow
 import wifi
 from adafruit_display_text import label
@@ -74,6 +74,9 @@ AUTO_CHAT_WINDOW = 60.0
 AUTO_RECONNECT_DELAY = 60.0
 AUTO_RECONNECT_DELAY_EXTENDED = 300.0
 PAIR_HOLD_SECONDS = 1.0
+LOOP_SLEEP_S = 0.04
+RX_MAX_PACKETS_PER_TICK = 6
+MAX_NETWORK_OPS_PER_TICK = 1
 
 # -- Modes --
 MODE_SEARCH = 0
@@ -92,26 +95,13 @@ pixels.fill(0)
 
 # MagTag buttons: A,B,C,D = D15,D14,D12,D11
 button_pins = (board.D15, board.D14, board.D12, board.D11)
-buttons = []
-for pin in button_pins:
-    b = digitalio.DigitalInOut(pin)
-    b.direction = digitalio.Direction.INPUT
-    b.pull = digitalio.Pull.UP
-    buttons.append(b)
+buttons = keypad.Keys(button_pins, value_when_pressed=False, pull=True)
 
 BTN_A, BTN_B, BTN_C, BTN_D = 0, 1, 2, 3
 
-def wait_release(btn_index):
-    while not buttons[btn_index].value:
-        time.sleep(0.03)
-
-def button_held(btn_index, hold_seconds):
-    start = time.monotonic()
-    while not buttons[btn_index].value:
-        if time.monotonic() - start >= hold_seconds:
-            return True
-        time.sleep(0.03)
-    return False
+btn_a_is_down = False
+btn_a_down_since = 0.0
+btn_a_hold_fired = False
 
 # -- ESP-NOW setup --
 wifi.radio.enabled = True
@@ -136,6 +126,21 @@ tx_attempts = 0
 tx_errors = 0
 rx_packets = 0
 parse_failures = 0
+match_rr_cursor = 0
+
+# Debug timing metrics (printed only when DEBUG_ESPNOW=1)
+debug_loop_max_ms = 0.0
+debug_server_call_max_ms = 0.0
+debug_server_call_last_ms = 0.0
+debug_rx_max_per_tick = 0
+debug_rx_last_per_tick = 0
+debug_button_events_max = 0
+debug_button_events_last = 0
+debug_network_ops_last = 0
+
+# Non-blocking LED effect queue
+led_effect_queue = []
+active_led_effect = None
 
 # Nearby peers
 nearby_peers = {}
@@ -242,6 +247,94 @@ def parse_message(data):
         }
     except Exception:
         return None
+
+
+def _queue_led_effect(color, flashes=2, on_s=0.08, off_s=0.08):
+    if flashes <= 0:
+        return
+    led_effect_queue.append(
+        {
+            "color": color,
+            "flashes_left": int(flashes),
+            "on_s": float(on_s),
+            "off_s": float(off_s),
+            "phase": "on",
+            "phase_until": 0.0,
+        }
+    )
+
+
+def _led_effect_override_color(now):
+    global active_led_effect
+
+    if active_led_effect is None and led_effect_queue:
+        active_led_effect = led_effect_queue.pop(0)
+        active_led_effect["phase"] = "on"
+        active_led_effect["phase_until"] = now + active_led_effect["on_s"]
+
+    while active_led_effect is not None and now >= active_led_effect.get("phase_until", 0.0):
+        if active_led_effect["phase"] == "on":
+            active_led_effect["phase"] = "off"
+            active_led_effect["phase_until"] = now + active_led_effect["off_s"]
+        else:
+            active_led_effect["flashes_left"] -= 1
+            if active_led_effect["flashes_left"] <= 0:
+                active_led_effect = None
+                if led_effect_queue:
+                    active_led_effect = led_effect_queue.pop(0)
+                    active_led_effect["phase"] = "on"
+                    active_led_effect["phase_until"] = now + active_led_effect["on_s"]
+            else:
+                active_led_effect["phase"] = "on"
+                active_led_effect["phase_until"] = now + active_led_effect["on_s"]
+
+    if active_led_effect is None:
+        return None
+    if active_led_effect["phase"] == "on":
+        return active_led_effect["color"]
+    return (0, 0, 0)
+
+
+def _record_server_call_duration(started_at):
+    global debug_server_call_last_ms, debug_server_call_max_ms
+    elapsed_ms = (time.monotonic() - started_at) * 1000.0
+    debug_server_call_last_ms = elapsed_ms
+    if elapsed_ms > debug_server_call_max_ms:
+        debug_server_call_max_ms = elapsed_ms
+
+
+def _handle_button_inputs(now):
+    global btn_a_is_down, btn_a_down_since, btn_a_hold_fired
+
+    handled_events = 0
+
+    event = buttons.events.get()
+    while event is not None:
+        handled_events += 1
+        idx = event.key_number
+        if idx == BTN_A:
+            if event.pressed:
+                btn_a_is_down = True
+                btn_a_down_since = now
+                btn_a_hold_fired = False
+            else:
+                was_down = btn_a_is_down
+                hold_fired = btn_a_hold_fired
+                btn_a_is_down = False
+                btn_a_hold_fired = False
+                if was_down and (not hold_fired):
+                    if current_mode == MODE_SEARCH:
+                        set_mode(MODE_CHAT)
+                    else:
+                        set_mode(MODE_SEARCH)
+        event = buttons.events.get()
+
+    if btn_a_is_down and (not btn_a_hold_fired) and current_mode == MODE_SEARCH:
+        if (now - btn_a_down_since) >= PAIR_HOLD_SECONDS:
+            btn_a_hold_fired = True
+            set_mode(MODE_CHAT, force_closest=True, force_empty_topic=True)
+
+    return handled_events
 
 def index_for_topic(common_list, topic):
     """Return index of topic in common_list (case-insensitive), or None."""
@@ -521,11 +614,7 @@ def get_match_led_color(match_pct, rssi):
 
 
 def flash_alert(color, flashes=2, on_s=0.08, off_s=0.08):
-    for _ in range(flashes):
-        pixels.fill(color)
-        time.sleep(on_s)
-        pixels.fill(0)
-        time.sleep(off_s)
+    _queue_led_effect(color, flashes=flashes, on_s=on_s, off_s=off_s)
 
 
 
@@ -586,25 +675,25 @@ def do_broadcast():
     last_broadcast = time.monotonic()
 
 def flash_new_peer():
-    for _ in range(2):
-        pixels.fill((0, 80, 80))
-        time.sleep(0.08)
-        pixels.fill(0)
-        time.sleep(0.08)
+    _queue_led_effect((0, 80, 80), flashes=2, on_s=0.08, off_s=0.08)
 
-def receive_all():
+def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver
     global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
     global rx_packets, parse_failures
 
     changed = False
+    processed = 0
     now = time.monotonic()
 
     while e:
+        if max_packets and processed >= max_packets:
+            break
         packet = e.read()
         if packet is None:
             break
+        processed += 1
         rx_packets += 1
 
         info = parse_message(packet.msg)
@@ -712,6 +801,7 @@ def receive_all():
 
     if changed:
         display_dirty = True
+    return processed
 
 # -------------------------
 # Pick closest peer
@@ -733,26 +823,30 @@ def pick_closest_peer(skip_blocked=False):
 # -- LEDs --
 def update_leds(phase):
     r, g, b = MODE_COLORS[current_mode]
-    if current_mode == MODE_SEARCH:
-        if (
-            search_match_latched and
-            search_match_peer_mac is not None and
-            _peer_is_server_match(search_match_peer_mac)
-        ):
-            # Matched peer found: root-pattern flash cadence.
-            on = ((phase // 5) % 2) == 0
-            pixels.fill(search_match_color if on else (0, 0, 0))
-        else:
-            # No active match: keep a steady search color (no flashing).
-            pixels.fill((0, 12, 0))
+    override = _led_effect_override_color(time.monotonic())
+    if override is not None:
+        pixels.fill(override)
     else:
-        if chat_peer_mac is not None and _peer_is_server_match(chat_peer_mac):
-            pixels.fill(_pair_led_color(bytes(my_mac), chat_peer_mac))
+        if current_mode == MODE_SEARCH:
+            if (
+                search_match_latched and
+                search_match_peer_mac is not None and
+                _peer_is_server_match(search_match_peer_mac)
+            ):
+                # Matched peer found: root-pattern flash cadence.
+                on = ((phase // 5) % 2) == 0
+                pixels.fill(search_match_color if on else (0, 0, 0))
+            else:
+                # No active match: keep a steady search color (no flashing).
+                pixels.fill((0, 12, 0))
         else:
-            idx = (phase // 5) % 4
-            pixels.fill((5, 4, 0))
-            pixels[idx] = (min(r * 3, 255), min(g * 3, 255), 0)
-            pixels[(idx + 2) % 4] = (min(r * 2, 255), min(g * 2, 255), 0)
+            if chat_peer_mac is not None and _peer_is_server_match(chat_peer_mac):
+                pixels.fill(_pair_led_color(bytes(my_mac), chat_peer_mac))
+            else:
+                idx = (phase // 5) % 4
+                pixels.fill((5, 4, 0))
+                pixels[idx] = (min(r * 3, 255), min(g * 3, 255), 0)
+                pixels[(idx + 2) % 4] = (min(r * 2, 255), min(g * 2, 255), 0)
     pixels.show()
 
 
@@ -1286,9 +1380,9 @@ def _sync_server_observations(now):
     global next_observe_sync
 
     if not server_enabled or server_auth_failed or server_client is None:
-        return
+        return False
     if now < next_observe_sync:
-        return
+        return False
 
     observations = []
     for mac, peer in nearby_peers.items():
@@ -1310,38 +1404,72 @@ def _sync_server_observations(now):
 
     if not observations:
         next_observe_sync = now + MATCH_OBSERVE_INTERVAL_S
-        return
+        return False
 
+    started = time.monotonic()
     result = server_client.post_observe(MY_DEVICE_ID, observations)
+    _record_server_call_duration(started)
     if result.get("ok"):
         next_observe_sync = now + MATCH_OBSERVE_INTERVAL_S
-        return
+        return True
 
     code = _mark_server_error(result)
     next_observe_sync = now + MATCH_ERROR_BACKOFF_S
     print("SERVER observe failed code={}".format(code or "UNKNOWN"))
+    return True
 
 
-def _sync_server_matches(now):
+def _peer_due_for_server_match(state, peer, now):
+    next_try = float(state.get("next_try") or 0.0)
+    if now >= next_try:
+        return True
+
+    last_rssi = state.get("last_match_rssi")
+    if last_rssi is None:
+        return False
+
+    delta = abs(int(peer.get("rssi", -100)) - int(last_rssi))
+    return delta >= MATCH_RSSI_RECHECK_DELTA
+
+
+def _sync_server_matches(now, max_calls=1):
+    global match_rr_cursor
+
     if not server_enabled or server_auth_failed or server_client is None:
-        return
+        return 0
+    if max_calls <= 0:
+        return 0
 
-    for mac, peer in nearby_peers.items():
+    peer_items = list(nearby_peers.items())
+    if not peer_items:
+        match_rr_cursor = 0
+        return 0
+
+    n = len(peer_items)
+    start_idx = match_rr_cursor % n
+    checked = 0
+    calls = 0
+
+    while checked < n and calls < max_calls:
+        idx = (start_idx + checked) % n
+        mac, peer = peer_items[idx]
         state = _get_peer_server_state(mac, create=True)
-        next_try = float(state.get("next_try") or 0.0)
-        if now < next_try:
-            last_rssi = state.get("last_match_rssi")
-            if last_rssi is None:
-                continue
-            delta = abs(int(peer.get("rssi", -100)) - int(last_rssi))
-            if delta < MATCH_RSSI_RECHECK_DELTA:
-                continue
+
+        if not _peer_due_for_server_match(state, peer, now):
+            checked += 1
+            continue
 
         peer_device_id = _mac_bytes_to_hex(mac)
         if not peer_device_id:
+            checked += 1
             continue
 
+        started = time.monotonic()
         result = server_client.post_match(MY_DEVICE_ID, peer_device_id, return_rationale=False)
+        _record_server_call_duration(started)
+        calls += 1
+        match_rr_cursor = (idx + 1) % n
+
         if result.get("ok"):
             data = result.get("data")
             if not isinstance(data, dict):
@@ -1375,12 +1503,17 @@ def _sync_server_matches(now):
                         state.get("confidence"),
                     )
                 )
-            continue
+        else:
+            code = _mark_server_error(result)
+            state["last_error"] = code or "UNKNOWN"
+            state["next_try"] = now + MATCH_ERROR_BACKOFF_S
+            print("SERVER match failed {} code={}".format(_mac_bytes_to_hex(mac), state["last_error"]))
 
-        code = _mark_server_error(result)
-        state["last_error"] = code or "UNKNOWN"
-        state["next_try"] = now + MATCH_ERROR_BACKOFF_S
-        print("SERVER match failed {} code={}".format(_mac_bytes_to_hex(mac), state["last_error"]))
+        checked += 1
+
+    if calls == 0:
+        match_rr_cursor = (start_idx + 1) % n
+    return calls
 
 
 # ===== MAIN LOOP =====
@@ -1398,45 +1531,35 @@ try:
     phase = 0
     while True:
         now = time.monotonic()
+        loop_started = now
 
-        # Buttons
-        if current_mode == MODE_SEARCH:
-            # D15 short press: enter CHAT, hold: pairing chat (no topic broadcast)
-            if not buttons[BTN_A].value:
-                if button_held(BTN_A, PAIR_HOLD_SECONDS):
-                    set_mode(MODE_CHAT, force_closest=True, force_empty_topic=True)
-                    wait_release(BTN_A)
-                else:
-                    set_mode(MODE_CHAT)
-            elif not buttons[BTN_B].value:
-                wait_release(BTN_B)
-            elif not buttons[BTN_C].value:
-                wait_release(BTN_C)
-
-        else:  # MODE_CHAT
-            # D15: back to SEARCH
-            if not buttons[BTN_A].value:
-                set_mode(MODE_SEARCH)
-                wait_release(BTN_A)
-            elif not buttons[BTN_B].value:
-                wait_release(BTN_B)
-            elif not buttons[BTN_C].value:
-                wait_release(BTN_C)
+        handled_events = _handle_button_inputs(now)
+        debug_button_events_last = handled_events
+        if handled_events > debug_button_events_max:
+            debug_button_events_max = handled_events
 
         # Periodic broadcast
         if now - last_broadcast >= BROADCAST_INTERVAL:
             do_broadcast()
 
-        # Receive
-        receive_all()
+        # Receive (bounded)
+        rx_this_tick = receive_all(RX_MAX_PACKETS_PER_TICK)
+        debug_rx_last_per_tick = rx_this_tick
+        if rx_this_tick > debug_rx_max_per_tick:
+            debug_rx_max_per_tick = rx_this_tick
 
         # LEDs first so HTTP timing has less impact on perceived blink cadence.
         update_leds(phase)
         phase = (phase + 1) % 200
 
         _sync_local_gate_cache()
-        _sync_server_observations(now)
-        _sync_server_matches(now)
+        network_ops = 0
+        if network_ops < MAX_NETWORK_OPS_PER_TICK:
+            if _sync_server_observations(now):
+                network_ops += 1
+        if network_ops < MAX_NETWORK_OPS_PER_TICK:
+            network_ops += _sync_server_matches(now, max_calls=(MAX_NETWORK_OPS_PER_TICK - network_ops))
+        debug_network_ops_last = network_ops
 
         # CHAT handshake timeout:
         # if peer never enters CHAT within 10s, return to SEARCH.
@@ -1462,8 +1585,16 @@ try:
                 channel_text = str(wifi.radio.ap_info.channel)
             except Exception:
                 pass
+            loop_elapsed_ms = (time.monotonic() - loop_started) * 1000.0
+            if loop_elapsed_ms > debug_loop_max_ms:
+                debug_loop_max_ms = loop_elapsed_ms
             print(
-                "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={} blocked_active={} srv_en={} auth_fail={}".format(
+                (
+                    "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={} "
+                    "blocked_active={} srv_en={} auth_fail={} btn_evt={} btn_evt_max={} "
+                    "rx_tick={} rx_tick_max={} net_ops={} srv_ms_last={:.1f} "
+                    "srv_ms_max={:.1f} loop_ms_max={:.1f}"
+                ).format(
                     MODE_NAMES[current_mode],
                     channel_text,
                     tx_attempts,
@@ -1474,6 +1605,14 @@ try:
                     len(auto_rematch_state),
                     int(server_enabled),
                     int(server_auth_failed),
+                    debug_button_events_last,
+                    debug_button_events_max,
+                    debug_rx_last_per_tick,
+                    debug_rx_max_per_tick,
+                    debug_network_ops_last,
+                    debug_server_call_last_ms,
+                    debug_server_call_max_ms,
+                    debug_loop_max_ms,
                 )
             )
             last_debug_log = now
@@ -1482,7 +1621,10 @@ try:
         if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
             render_display()
 
-        time.sleep(0.08)
+        loop_elapsed_ms = (time.monotonic() - loop_started) * 1000.0
+        if loop_elapsed_ms > debug_loop_max_ms:
+            debug_loop_max_ms = loop_elapsed_ms
+        time.sleep(LOOP_SLEEP_S)
 
 except Exception as ex:
     # Blink NeoPixels red

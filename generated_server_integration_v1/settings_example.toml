@@ -1,0 +1,8 @@
+MY_NAME = "default"
+MY_INTERESTS = "github, python, wearables, circuitpython, pc"
+ESPNOW_CHANNEL = 6
+CIRCUITPY_WIFI_SSID = "yourwifiname"
+CIRCUITPY_WIFI_PASSWORD = "yourwifipassword"
+MATCH_ENABLE_SERVER=1
+MATCH_SERVER_BASE_URL="http://your.pc.ip.address:8000"
+MATCH_SERVER_APP_KEY="samekeyinyourserver"
