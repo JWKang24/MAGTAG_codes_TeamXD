@@ -27,3 +27,11 @@ Server-integrated runtime generated from current baseline.
 - SEARCH and badge match behavior are driven by server `decision=true` only.
 - Known non-matches are not actively re-queried while they remain nearby.
 - No local fallback match path is used if server is unavailable.
+- Client requests `return_topic=true` on `/v1/match`.
+- Topic parsing uses a single server `topic` string and supports delimiters `|`, `,`, `;`.
+- Device keeps at most 2 topics per matched peer.
+- Topic priority is: server topics, then peer-broadcast topic, then `Conversation`.
+- CHAT topics are locked at entry (no live topic swapping mid-chat).
+- Topic image UI is all-or-nothing:
+  - If all required topic images exist, render visual topic panel.
+  - If any topic image is missing, fallback to text-based UI behavior.

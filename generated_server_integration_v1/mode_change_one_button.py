@@ -175,6 +175,7 @@ search_match_latched = False
 search_match_peer_mac = None
 search_match_peer_name = ""
 search_match_color = (0, 0, 0)
+search_match_topics = []
 
 # -- Badge match alert state --
 RSSI_BADGE_THRESHOLD = -65
@@ -487,6 +488,109 @@ def _peer_confidence(mac):
         return 0.0
 
 
+def _normalize_topic_token(text):
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.strip().split())
+
+
+def _parse_topic_string_max2(raw):
+    text = _normalize_topic_token(raw)
+    if not text:
+        return []
+
+    parts = [text]
+    for delim in ("|", ",", ";"):
+        if delim in text:
+            parts = text.split(delim)
+            break
+
+    out = []
+    seen = set()
+    for part in parts:
+        topic = _normalize_topic_token(part)
+        if not topic:
+            continue
+        key = topic.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(topic)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def _peer_server_topics(mac):
+    state = _get_peer_server_state(mac, create=False) or {}
+    raw_topics = state.get("topics")
+    if isinstance(raw_topics, list):
+        parsed = []
+        seen = set()
+        for item in raw_topics:
+            topic = _normalize_topic_token(item)
+            if not topic:
+                continue
+            key = topic.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed.append(topic)
+            if len(parsed) >= 2:
+                break
+        if parsed:
+            return parsed
+
+    single = _normalize_topic_token(state.get("topic"))
+    return [single] if single else []
+
+
+def _peer_broadcast_topics(mac):
+    peer = nearby_peers.get(mac)
+    if not isinstance(peer, dict):
+        return []
+    return _parse_topic_string_max2(peer.get("topic"))
+
+
+def _resolve_topics_for_peer(mac):
+    topics = _peer_server_topics(mac)
+    if topics:
+        return topics[:2]
+    topics = _peer_broadcast_topics(mac)
+    if topics:
+        return topics[:2]
+    return ["Conversation"]
+
+
+def _resolve_search_topics_for_peer(mac):
+    topics = _peer_server_topics(mac)
+    if topics:
+        return topics[:2]
+    topics = _peer_broadcast_topics(mac)
+    if topics:
+        return topics[:2]
+    return []
+
+
+def _topics_debug_str(topics):
+    cleaned = []
+    for item in topics[:2]:
+        topic = _normalize_topic_token(item)
+        if topic:
+            cleaned.append(topic)
+    if not cleaned:
+        return "-"
+    return "|".join(cleaned)
+
+
+def _topic_source_for_peer(mac):
+    if _peer_server_topics(mac):
+        return "server"
+    if _peer_broadcast_topics(mac):
+        return "peer"
+    return "none"
+
+
 def _pick_best_server_match_peer(require_peer_targets_me=False):
     best_mac = None
     best_conf = -1.0
@@ -596,6 +700,89 @@ def _topic_to_image_path(topic):
     return None
 
 
+def _topic_image_paths_or_none(topics):
+    cleaned = []
+    for topic in topics[:2]:
+        normalized = _normalize_topic_token(topic)
+        if normalized:
+            cleaned.append(normalized)
+
+    if not cleaned:
+        return None
+
+    paths = []
+    for topic in cleaned:
+        image_path = _topic_to_image_path(topic)
+        if not image_path:
+            return None
+        paths.append(image_path)
+    return paths
+
+
+def _render_topic_visual_panel(group, start_y, topics):
+    topic_list = []
+    for topic in topics[:2]:
+        normalized = _normalize_topic_token(topic)
+        if normalized:
+            topic_list.append(normalized)
+
+    image_paths = _topic_image_paths_or_none(topic_list)
+    if not image_paths:
+        return False, start_y
+
+    try:
+        if len(image_paths) >= 2:
+            bmp_left = displayio.OnDiskBitmap(image_paths[0])
+            bmp_right = displayio.OnDiskBitmap(image_paths[1])
+            half_width = 148
+            left_x = max(0, (half_width - bmp_left.width) // 2)
+            right_x = half_width + max(0, (half_width - bmp_right.width) // 2)
+            top_y = max(start_y, 30)
+            panel_height = bmp_left.height if bmp_left.height >= bmp_right.height else bmp_right.height
+            max_bottom = 102
+            if top_y + panel_height > max_bottom:
+                top_y = max(22, max_bottom - panel_height)
+
+            group.append(displayio.TileGrid(bmp_left, pixel_shader=bmp_left.pixel_shader, x=left_x, y=top_y))
+            group.append(displayio.TileGrid(bmp_right, pixel_shader=bmp_right.pixel_shader, x=right_x, y=top_y))
+            return True, top_y + panel_height
+
+        bmp = displayio.OnDiskBitmap(image_paths[0])
+        left_width = 152
+        top_y = max(start_y, 30)
+        max_bottom = 102
+        if top_y + bmp.height > max_bottom:
+            top_y = max(22, max_bottom - bmp.height)
+        image_x = max(0, (left_width - bmp.width) // 2)
+        group.append(displayio.TileGrid(bmp, pixel_shader=bmp.pixel_shader, x=image_x, y=top_y))
+
+        exact_topic = topic_list[0]
+        max_chars = 22
+        line_1 = exact_topic[:max_chars]
+        line_2 = exact_topic[max_chars : max_chars * 2] if len(exact_topic) > max_chars else ""
+        text_x = 162
+        group.append(label.Label(
+            terminalio.FONT,
+            text=line_1,
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(text_x, top_y + 8),
+            scale=1,
+        ))
+        if line_2:
+            group.append(label.Label(
+                terminalio.FONT,
+                text=line_2,
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(text_x, top_y + 20),
+                scale=1,
+            ))
+        return True, top_y + bmp.height
+    except Exception:
+        return False, start_y
+
+
 # -------------------------
 # Badge match alert
 # -------------------------
@@ -644,12 +831,21 @@ def check_badge_matches(packet_mac, peer_info):
         confidence = 0.0
     match_pct = int(max(0, min(100, confidence * 100.0)))
     color = get_match_led_color(match_pct, rssi)
+    server_topics = _peer_server_topics(packet_mac)
+    peer_topics = _peer_broadcast_topics(packet_mac)
+    topic_source = _topic_source_for_peer(packet_mac)
     print(
-        "ALERT! Server match with {}: conf={}%, rssi={} dBm, color={}".format(
+        (
+            "ALERT! Server match with {}: conf={}%, rssi={} dBm, color={} "
+            "topic_src={} server_topics={} peer_topics={}"
+        ).format(
             peer_info.get("name", ""),
             match_pct,
             rssi,
             color,
+            topic_source,
+            _topics_debug_str(server_topics),
+            _topics_debug_str(peer_topics),
         )
     )
     flash_alert(color)
@@ -679,7 +875,7 @@ def flash_new_peer():
 
 def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver
-    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color, search_match_topics
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
     global rx_packets, parse_failures
 
@@ -755,16 +951,6 @@ def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
     if current_mode == MODE_CHAT:
         peer = nearby_peers.get(chat_peer_mac) if chat_peer_mac else None
         if peer:
-            if chat_force_empty_topic:
-                new_common = []
-            else:
-                new_common = ["Conversation"]
-            if new_common != chat_common:
-                chat_common = new_common
-                if not chat_common:
-                    chat_common_idx = 0
-                changed = True
-
             peer_in_chat = (peer.get("mode") == MODE_CHAT)
             if peer_in_chat:
                 if chat_peer_mac:
@@ -782,22 +968,26 @@ def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
         if best_mac is not None:
             best_peer_name = nearby_peers.get(best_mac, {}).get("name", "")
             new_color = _pair_led_color(bytes(my_mac), best_mac)
+            new_topics = _resolve_search_topics_for_peer(best_mac)
             if (not search_match_latched or
                     best_mac != search_match_peer_mac or
                     best_peer_name != search_match_peer_name or
-                    new_color != search_match_color):
+                    new_color != search_match_color or
+                    new_topics != search_match_topics):
                 changed = True
             search_match_peer_mac = best_mac
             search_match_peer_name = best_peer_name
             search_match_color = new_color
+            search_match_topics = new_topics
             search_match_latched = True
         else:
-            if search_match_latched or search_match_peer_mac:
+            if search_match_latched or search_match_peer_mac or search_match_topics:
                 changed = True
             search_match_latched = False
             search_match_peer_mac = None
             search_match_peer_name = ""
             search_match_color = (0, 0, 0)
+            search_match_topics = []
 
     if changed:
         display_dirty = True
@@ -983,6 +1173,8 @@ def render_display():
     y = 50 if current_mode == MODE_SEARCH else 42
 
     if current_mode == MODE_SEARCH:
+        search_images_drawn = False
+
         if search_match_peer_name:
             g.append(label.Label(
                 terminalio.FONT,
@@ -993,6 +1185,23 @@ def render_display():
                 scale=search_text_scale,
             ))
             y += 18 if search_text_scale == 2 else 12
+
+        if search_match_topics:
+            topics_line = "Topic: " + " | ".join(search_match_topics)
+            g.append(label.Label(
+                terminalio.FONT,
+                text=topics_line[:30 if search_text_scale == 2 else 44],
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+            ))
+            y += 12
+
+            rendered, panel_bottom = _render_topic_visual_panel(g, y, search_match_topics)
+            if rendered:
+                search_images_drawn = True
+                y = panel_bottom + 4
 
         g.append(label.Label(
             terminalio.FONT,
@@ -1006,6 +1215,12 @@ def render_display():
 
         if nearby_peers:
             max_peers = 2 if search_text_scale == 2 else 4
+            if search_images_drawn:
+                # Keep matched-topic visuals prioritized in SEARCH when space is tight.
+                row_step = 17 if search_text_scale == 2 else 11
+                content_bottom = 120
+                room_rows = max(0, (content_bottom - y) // row_step)
+                max_peers = min(max_peers, room_rows)
             for mac, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:max_peers]:
                 status = _peer_status_text(mac)
                 line = "{} {} {}".format(
@@ -1029,8 +1244,8 @@ def render_display():
             color=0x333333,
             anchor_point=(0.5, 1.0),
             anchored_position=(148, 127),
-            scale=1,
-        ))
+                scale=1,
+            ))
 
     else:
         peer_name = "(None)"
@@ -1065,71 +1280,65 @@ def render_display():
             ))
             y += 12
 
-        topic = chat_common[chat_common_idx] if (chat_common and peer_in_chat) else ""
-        topic_text = _display_interest_text(topic)
+        chat_topics = chat_common[:2] if (chat_common and peer_in_chat) else []
+        topic_labels = [_display_interest_text(topic) for topic in chat_topics if _display_interest_text(topic)]
+        topic_text = " | ".join(topic_labels)
         idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common)) if chat_common else ""
-        image_path = _topic_to_image_path(topic)
         image_drawn = False
 
-        if topic_text:
-            g.append(label.Label(
-                terminalio.FONT,
-                text="Topic: " + topic_text[:20],
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=1,
-            ))
-            if idx_text:
-                g.append(label.Label(
-                    terminalio.FONT,
-                    text=idx_text,
-                    color=0x555555,
-                    anchor_point=(1.0, 0.0),
-                    anchored_position=(290, y),
-                    scale=1,
-                ))
-            y += 12
-
-        if image_path:
-            try:
-                bmp = displayio.OnDiskBitmap(image_path)
-                image_x = max(0, (296 - bmp.width) // 2)
-                # Keep image a bit higher so footer instructions stay clear.
-                image_y = max(y - 32, 32)
-                max_bottom = 90
-                if image_y + bmp.height > max_bottom:
-                    image_y = max(-8, max_bottom - bmp.height)
-                g.append(displayio.TileGrid(bmp, pixel_shader=bmp.pixel_shader, x=image_x, y=image_y))
+        if chat_topics:
+            rendered, panel_bottom = _render_topic_visual_panel(g, y, chat_topics)
+            if rendered:
                 image_drawn = True
-            except Exception:
-                image_drawn = False
+                y = panel_bottom + 4
 
         if not image_drawn:
-            if peer_in_chat:
-                fallback = "Conversation"
-            else:
-                fallback = "Waiting: peer press A"
-            g.append(label.Label(
-                terminalio.FONT,
-                text=fallback[:32],
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=2,
-            ))
-            y += 22
-
-            if idx_text:
+            if topic_text:
                 g.append(label.Label(
                     terminalio.FONT,
-                    text=idx_text,
-                    color=0x555555,
+                    text="Topic: " + topic_text[:20],
+                    color=0x000000,
                     anchor_point=(0.0, 0.0),
                     anchored_position=(6, y),
                     scale=1,
                 ))
+                if idx_text:
+                    g.append(label.Label(
+                        terminalio.FONT,
+                        text=idx_text,
+                        color=0x555555,
+                        anchor_point=(1.0, 0.0),
+                        anchored_position=(290, y),
+                        scale=1,
+                    ))
                 y += 12
+
+            # Only show big fallback copy when no topic text is available.
+            if not topic_text:
+                if peer_in_chat:
+                    fallback = "Conversation"
+                else:
+                    fallback = "Waiting: peer press A"
+                g.append(label.Label(
+                    terminalio.FONT,
+                    text=fallback[:32],
+                    color=0x000000,
+                    anchor_point=(0.0, 0.0),
+                    anchored_position=(6, y),
+                    scale=2,
+                ))
+                y += 22
+
+                if idx_text:
+                    g.append(label.Label(
+                        terminalio.FONT,
+                        text=idx_text,
+                        color=0x555555,
+                        anchor_point=(0.0, 0.0),
+                        anchored_position=(6, y),
+                        scale=1,
+                    ))
+                    y += 12
 
         g.append(label.Label(
             terminalio.FONT,
@@ -1154,7 +1363,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, chat_force_empty_topic
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
-    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color, search_match_topics
     global blocked_auto_rematch_peers
 
     if new_mode == current_mode:
@@ -1179,6 +1388,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         search_match_peer_mac = None
         search_match_peer_name = ""
         search_match_color = (0, 0, 0)
+        search_match_topics = []
 
         chat_peer_mac = selected_peer
         chat_force_empty_topic = force_empty_topic
@@ -1187,7 +1397,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         if chat_force_empty_topic:
             chat_common = []
         else:
-            chat_common = ["Conversation"]
+            chat_common = _resolve_topics_for_peer(chat_peer_mac)
         _mark_chat_attempt(chat_peer_mac)
     else:
         if chat_peer_mac is not None:
@@ -1198,6 +1408,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         search_match_peer_mac = None
         search_match_peer_name = ""
         search_match_color = (0, 0, 0)
+        search_match_topics = []
         chat_peer_mac = None
         chat_common = []
         chat_common_idx = 0
@@ -1227,6 +1438,8 @@ def _new_peer_server_state():
         "decision": None,
         "confidence": None,
         "source": None,
+        "topic": "",
+        "topics": [],
         "eligible": None,
         "reason": None,
         "next_try": 0.0,
@@ -1465,7 +1678,12 @@ def _sync_server_matches(now, max_calls=1):
             continue
 
         started = time.monotonic()
-        result = server_client.post_match(MY_DEVICE_ID, peer_device_id, return_rationale=False)
+        result = server_client.post_match(
+            MY_DEVICE_ID,
+            peer_device_id,
+            return_rationale=False,
+            return_topic=True,
+        )
         _record_server_call_duration(started)
         calls += 1
         match_rr_cursor = (idx + 1) % n
@@ -1483,6 +1701,9 @@ def _sync_server_matches(now, max_calls=1):
             state["decision"] = data.get("decision")
             state["confidence"] = data.get("confidence")
             state["source"] = data.get("source")
+            parsed_topics = _parse_topic_string_max2(data.get("topic"))
+            state["topics"] = parsed_topics
+            state["topic"] = parsed_topics[0] if parsed_topics else ""
             state["eligible"] = eligibility.get("eligible")
             state["reason"] = eligibility.get("reason")
             state["last_error"] = ""
@@ -1495,12 +1716,21 @@ def _sync_server_matches(now, max_calls=1):
                 state["next_try"] = now + MATCH_REQUEST_INTERVAL_S
 
             if old_decision != state.get("decision"):
+                server_topics = _peer_server_topics(mac)
+                peer_topics = _peer_broadcast_topics(mac)
+                topic_source = _topic_source_for_peer(mac)
                 print(
-                    "SERVER_MATCH {} decision={} source={} conf={}".format(
+                    (
+                        "SERVER_MATCH {} decision={} source={} conf={} "
+                        "topic_src={} server_topics={} peer_topics={}"
+                    ).format(
                         _mac_bytes_to_hex(mac),
                         state.get("decision"),
                         state.get("source"),
                         state.get("confidence"),
+                        topic_source,
+                        _topics_debug_str(server_topics),
+                        _topics_debug_str(peer_topics),
                     )
                 )
         else:
