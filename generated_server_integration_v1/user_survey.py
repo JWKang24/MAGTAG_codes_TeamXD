@@ -28,33 +28,6 @@ def toml_escape(text):
     return (text or "").replace("\\", "\\\\").replace('"', '\\"')
 
 
-def normalize_base_url(text):
-    value = (text or "").strip()
-    while value.endswith("/"):
-        value = value[:-1]
-    return value
-
-
-def validate_server_base_url(base_url):
-    value = (base_url or "").strip()
-    if not value:
-        return True, ""
-    low = value.lower()
-    if not (low.startswith("http://") or low.startswith("https://")):
-        return False, "Server Base URL must start with http:// or https://"
-    if (
-        "://0.0.0.0" in low
-        or "://127.0.0.1" in low
-        or "://localhost" in low
-        or "://[::1]" in low
-    ):
-        return (
-            False,
-            "Server Base URL host is not reachable from badge. Use laptop LAN IP (e.g. http://192.168.1.10:8000).",
-        )
-    return True, ""
-
-
 def url_decode(text):
     text = (text or "").replace("+", " ")
     out = []
@@ -137,19 +110,17 @@ def get_settings_path():
         return "settings.toml"
 
 
-def write_settings(name, server_base_url, server_app_key):
+def write_settings(name, interest_blurb):
     path = get_settings_path()
     clean_name = (name or "MagTag").strip()[:MAX_NAME_LEN]
-    clean_base_url = normalize_base_url(server_base_url)
-    clean_app_key = (server_app_key or "").strip()
+    clean_interest = (interest_blurb or "").strip()[:MAX_INTEREST_LEN]
 
     with open(path, "r") as f:
         lines = f.read().splitlines()
 
     replacements = {
         "MY_NAME": clean_name,
-        "MATCH_SERVER_BASE_URL": clean_base_url,
-        "MATCH_SERVER_APP_KEY": clean_app_key,
+        "MY_INTERESTS": clean_interest,
     }
     seen = {k: False for k in replacements}
     out = []
@@ -173,13 +144,10 @@ def write_settings(name, server_base_url, server_app_key):
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
 
-    return clean_name, clean_base_url, clean_app_key
+    return clean_name, clean_interest
 
 
 def build_form_page(
-    name,
-    server_base_url,
-    server_app_key,
     interest_blurb,
     device_id,
     message="",
@@ -200,15 +168,9 @@ def build_form_page(
 <p><b>Device ID:</b> {}</p>
 <form method="POST" action="/">
 <label><b>Name</b></label><br>
-<input name="name" value="{}" style="width:100%; padding:8px; margin:6px 0 12px 0;"><br>
+<input name="name" value="" style="width:100%; padding:8px; margin:6px 0 12px 0;"><br>
 
-<label><b>Server Base URL</b></label><br>
-<input name="server_base_url" value="{}" placeholder="http://192.168.1.10:8000" style="width:100%; padding:8px; margin:6px 0 12px 0;"><br>
-
-<label><b>Server App Key</b></label><br>
-<input type="password" name="server_app_key" value="{}" style="width:100%; padding:8px; margin:6px 0 12px 0;"><br>
-
-<label><b>Interest Paragraph (optional test upload to server)</b></label><br>
+<label><b>Interest Paragraph</b></label><br>
 <textarea name="interest_blurb" rows="5" style="width:100%; padding:8px; margin:6px 0 12px 0;">{}</textarea><br>
 
 <input type="submit" value="Save and Continue" style="padding:10px 14px;">
@@ -218,9 +180,6 @@ def build_form_page(
 """.format(
         msg_html,
         html_escape(device_id),
-        html_escape(name),
-        html_escape(server_base_url),
-        html_escape(server_app_key),
         html_escape(interest_blurb),
     )
 
@@ -272,35 +231,14 @@ def index(request: Request):
         print("POST /")
         form = get_request_form_data(request)
 
-        name = form.get("name", current_name)
-        base_url = normalize_base_url(form.get("server_base_url", current_server_base_url))
-        app_key = form.get("server_app_key", current_server_app_key)
+        name = form.get("name", "")
         interest_blurb = (form.get("interest_blurb", "") or "").strip()[:MAX_INTEREST_LEN]
-        is_valid_url, url_error = validate_server_base_url(base_url)
-        if not is_valid_url:
-            html = build_form_page(
-                name,
-                base_url,
-                app_key,
-                interest_blurb,
-                device_id,
-                url_error,
-            )
-            return Response(request, html, content_type="text/html")
 
         try:
-            current_name, current_server_base_url, current_server_app_key = write_settings(
-                name,
-                base_url,
-                app_key,
-            )
-            current_interest_blurb = interest_blurb
+            current_name, current_interest_blurb = write_settings(name, interest_blurb)
         except Exception as ex:
             html = build_form_page(
-                current_name,
-                current_server_base_url,
-                current_server_app_key,
-                current_interest_blurb,
+                interest_blurb,
                 device_id,
                 "Save failed: {}".format(ex),
             )
@@ -323,15 +261,10 @@ def index(request: Request):
                         upload_note = "Interest upload failed: {}".format(
                             err_code
                         )
-                        if err_code == "NETWORK_ERROR":
-                            upload_note = (
-                                "{} Use your laptop LAN IP in Server Base URL "
-                                "(e.g. http://192.168.1.10:8000)."
-                            ).format(upload_note)
                 except Exception as ex:
                     upload_note = "Interest upload failed: {}".format(ex)
             else:
-                upload_note = "Interest not uploaded: missing server URL/app key."
+                upload_note = "Interest not uploaded: server config missing."
 
         message = "Saved. Starting nearby user search..."
         if upload_note:
@@ -339,10 +272,7 @@ def index(request: Request):
 
         survey_complete = True
         html = build_form_page(
-            current_name,
-            current_server_base_url,
-            current_server_app_key,
-            current_interest_blurb,
+            "",
             device_id,
             message,
         )
@@ -350,10 +280,7 @@ def index(request: Request):
 
     print("GET /")
     html = build_form_page(
-        current_name,
-        current_server_base_url,
-        current_server_app_key,
-        current_interest_blurb,
+        "",
         device_id,
     )
     return Response(request, html, content_type="text/html")

@@ -4,7 +4,7 @@ import board
 import displayio
 import terminalio
 import neopixel
-import digitalio
+import keypad
 import espnow
 import wifi
 from adafruit_display_text import label
@@ -44,7 +44,7 @@ def _get_env_bool(key, default=True):
     return _get_env_int(key, d) != 0
 
 MY_NAME = _get_env_str("MY_NAME", "MagTag")
-MY_INTERESTS = []
+MY_INTERESTS = _get_env_str("MY_INTERESTS", "")
 ESPNOW_CHANNEL = _get_env_int("ESPNOW_CHANNEL", 6)
 ESPNOW_PEER_CHANNEL = _get_env_int("ESPNOW_PEER_CHANNEL", 0)
 RECENT_CHAT_PEERS_TOML = "/recent_chat_peers.toml"
@@ -56,10 +56,12 @@ MATCH_ENABLE_SERVER = _get_env_bool("MATCH_ENABLE_SERVER", True)
 MATCH_SERVER_BASE_URL = _get_env_str("MATCH_SERVER_BASE_URL", "")
 MATCH_SERVER_APP_KEY = _get_env_str("MATCH_SERVER_APP_KEY", "")
 MATCH_HTTP_TIMEOUT_S = _get_env_float("MATCH_HTTP_TIMEOUT_S", 2.0)
-MATCH_OBSERVE_INTERVAL_S = _get_env_float("MATCH_OBSERVE_INTERVAL_S", 2.0)
+MATCH_OBSERVE_INTERVAL_S = _get_env_float("MATCH_OBSERVE_INTERVAL_S", 1.0)
 MATCH_REQUEST_INTERVAL_S = _get_env_float("MATCH_REQUEST_INTERVAL_S", 3.0)
 MATCH_ERROR_BACKOFF_S = _get_env_float("MATCH_ERROR_BACKOFF_S", 8.0)
 MATCH_RSSI_RECHECK_DELTA = _get_env_int("MATCH_RSSI_RECHECK_DELTA", 8)
+WIFI_SSID = _get_env_str("CIRCUITPY_WIFI_SSID", "")
+WIFI_PASSWORD = _get_env_str("CIRCUITPY_WIFI_PASSWORD", "")
 
 # Timing
 BROADCAST_INTERVAL = 2.0
@@ -72,6 +74,9 @@ AUTO_CHAT_WINDOW = 60.0
 AUTO_RECONNECT_DELAY = 60.0
 AUTO_RECONNECT_DELAY_EXTENDED = 300.0
 PAIR_HOLD_SECONDS = 1.0
+LOOP_SLEEP_S = 0.04
+RX_MAX_PACKETS_PER_TICK = 6
+MAX_NETWORK_OPS_PER_TICK = 1
 
 # -- Modes --
 MODE_SEARCH = 0
@@ -90,26 +95,13 @@ pixels.fill(0)
 
 # MagTag buttons: A,B,C,D = D15,D14,D12,D11
 button_pins = (board.D15, board.D14, board.D12, board.D11)
-buttons = []
-for pin in button_pins:
-    b = digitalio.DigitalInOut(pin)
-    b.direction = digitalio.Direction.INPUT
-    b.pull = digitalio.Pull.UP
-    buttons.append(b)
+buttons = keypad.Keys(button_pins, value_when_pressed=False, pull=True)
 
 BTN_A, BTN_B, BTN_C, BTN_D = 0, 1, 2, 3
 
-def wait_release(btn_index):
-    while not buttons[btn_index].value:
-        time.sleep(0.03)
-
-def button_held(btn_index, hold_seconds):
-    start = time.monotonic()
-    while not buttons[btn_index].value:
-        if time.monotonic() - start >= hold_seconds:
-            return True
-        time.sleep(0.03)
-    return False
+btn_a_is_down = False
+btn_a_down_since = 0.0
+btn_a_hold_fired = False
 
 # -- ESP-NOW setup --
 wifi.radio.enabled = True
@@ -134,6 +126,21 @@ tx_attempts = 0
 tx_errors = 0
 rx_packets = 0
 parse_failures = 0
+match_rr_cursor = 0
+
+# Debug timing metrics (printed only when DEBUG_ESPNOW=1)
+debug_loop_max_ms = 0.0
+debug_server_call_max_ms = 0.0
+debug_server_call_last_ms = 0.0
+debug_rx_max_per_tick = 0
+debug_rx_last_per_tick = 0
+debug_button_events_max = 0
+debug_button_events_last = 0
+debug_network_ops_last = 0
+
+# Non-blocking LED effect queue
+led_effect_queue = []
+active_led_effect = None
 
 # Nearby peers
 nearby_peers = {}
@@ -145,6 +152,7 @@ server_client = None
 server_enabled = False
 server_auth_failed = False
 next_observe_sync = 0.0
+self_interest_synced = False
 
 # Chat state
 chat_peer_mac = None
@@ -164,8 +172,10 @@ auto_rematch_state = {}
 
 # Search-mode match LED latch state
 search_match_latched = False
-search_match_topic = ""
+search_match_peer_mac = None
+search_match_peer_name = ""
 search_match_color = (0, 0, 0)
+search_match_topics = []
 
 # -- Badge match alert state --
 RSSI_BADGE_THRESHOLD = -65
@@ -187,10 +197,17 @@ def build_message():
             topic_str = chat_common[chat_common_idx][:30]
         if isinstance(chat_peer_mac, (bytes, bytearray)):
             peer_mac_hex = chat_peer_mac.hex()
+            if _peer_is_server_match(chat_peer_mac):
+                shared_flag = "1"
         else:
             peer_mac_hex = ""
         idx_str = str(chat_common_idx)
         ver_str = str(chat_idx_ver)
+    else:
+        target_peer = _pick_best_server_match_peer()
+        if isinstance(target_peer, (bytes, bytearray)):
+            peer_mac_hex = target_peer.hex()
+            shared_flag = "1"
 
     parts = [
         str(current_mode),
@@ -216,6 +233,7 @@ def parse_message(data):
         interests = [s.strip() for s in parts[2].split(",") if s.strip()]
         topic = parts[3].strip()
         peer_mac = bytes.fromhex(parts[4]) if parts[4] else None
+        shared_flag = (parts[5].strip() == "1")
         common_idx = int(parts[6]) if parts[6] else 0
         idx_ver = int(parts[7]) if parts[7] else 0
         return {
@@ -224,30 +242,100 @@ def parse_message(data):
             "interests": interests,
             "topic": topic,
             "peer_mac": peer_mac,
+            "shared_flag": shared_flag,
             "common_idx": common_idx,
             "idx_ver": idx_ver,
         }
     except Exception:
         return None
 
-def compute_match(mine, theirs):
-    mine_set = set(s.lower() for s in mine)
-    theirs_set = set(s.lower() for s in theirs)
-    common = mine_set & theirs_set
-    total = len(mine_set | theirs_set)
-    if total == 0:
-        return [], 0
-    pct = int((len(common) / total) * 100)
-    return sorted(common), pct
+
+def _queue_led_effect(color, flashes=2, on_s=0.08, off_s=0.08):
+    if flashes <= 0:
+        return
+    led_effect_queue.append(
+        {
+            "color": color,
+            "flashes_left": int(flashes),
+            "on_s": float(on_s),
+            "off_s": float(off_s),
+            "phase": "on",
+            "phase_until": 0.0,
+        }
+    )
 
 
-def first_common_interest(mine, theirs):
-    theirs_set = set(s.lower() for s in theirs)
-    for item in mine:
-        if item.lower() in theirs_set:
-            return item
-    return None
+def _led_effect_override_color(now):
+    global active_led_effect
 
+    if active_led_effect is None and led_effect_queue:
+        active_led_effect = led_effect_queue.pop(0)
+        active_led_effect["phase"] = "on"
+        active_led_effect["phase_until"] = now + active_led_effect["on_s"]
+
+    while active_led_effect is not None and now >= active_led_effect.get("phase_until", 0.0):
+        if active_led_effect["phase"] == "on":
+            active_led_effect["phase"] = "off"
+            active_led_effect["phase_until"] = now + active_led_effect["off_s"]
+        else:
+            active_led_effect["flashes_left"] -= 1
+            if active_led_effect["flashes_left"] <= 0:
+                active_led_effect = None
+                if led_effect_queue:
+                    active_led_effect = led_effect_queue.pop(0)
+                    active_led_effect["phase"] = "on"
+                    active_led_effect["phase_until"] = now + active_led_effect["on_s"]
+            else:
+                active_led_effect["phase"] = "on"
+                active_led_effect["phase_until"] = now + active_led_effect["on_s"]
+
+    if active_led_effect is None:
+        return None
+    if active_led_effect["phase"] == "on":
+        return active_led_effect["color"]
+    return (0, 0, 0)
+
+
+def _record_server_call_duration(started_at):
+    global debug_server_call_last_ms, debug_server_call_max_ms
+    elapsed_ms = (time.monotonic() - started_at) * 1000.0
+    debug_server_call_last_ms = elapsed_ms
+    if elapsed_ms > debug_server_call_max_ms:
+        debug_server_call_max_ms = elapsed_ms
+
+
+def _handle_button_inputs(now):
+    global btn_a_is_down, btn_a_down_since, btn_a_hold_fired
+
+    handled_events = 0
+
+    event = buttons.events.get()
+    while event is not None:
+        handled_events += 1
+        idx = event.key_number
+        if idx == BTN_A:
+            if event.pressed:
+                btn_a_is_down = True
+                btn_a_down_since = now
+                btn_a_hold_fired = False
+            else:
+                was_down = btn_a_is_down
+                hold_fired = btn_a_hold_fired
+                btn_a_is_down = False
+                btn_a_hold_fired = False
+                if was_down and (not hold_fired):
+                    if current_mode == MODE_SEARCH:
+                        set_mode(MODE_CHAT)
+                    else:
+                        set_mode(MODE_SEARCH)
+        event = buttons.events.get()
+
+    if btn_a_is_down and (not btn_a_hold_fired) and current_mode == MODE_SEARCH:
+        if (now - btn_a_down_since) >= PAIR_HOLD_SECONDS:
+            btn_a_hold_fired = True
+            set_mode(MODE_CHAT, force_closest=True, force_empty_topic=True)
+
+    return handled_events
 
 def index_for_topic(common_list, topic):
     """Return index of topic in common_list (case-insensitive), or None."""
@@ -280,35 +368,7 @@ def _is_blocked_peer_mac(mac):
     mac_hex = _mac_bytes_to_hex(mac)
     if (not mac_hex) or (mac_hex == _mac_bytes_to_hex(my_mac)):
         return False
-    if bytes.fromhex(mac_hex) in blocked_auto_rematch_peers:
-        return True
-
-    state = auto_rematch_state.get(mac_hex)
-    if state is None:
-        return False
-
-    now = time.monotonic()
-    cooldown_until = state.get("cooldown_until", 0.0)
-    if cooldown_until and now < cooldown_until:
-        return True
-
-    if cooldown_until and now >= cooldown_until:
-        del auto_rematch_state[mac_hex]
-        return False
-
-    window_deadline = state.get("window_deadline", 0.0)
-    if window_deadline and now >= window_deadline:
-        if state.get("had_chat_attempt", False):
-            del auto_rematch_state[mac_hex]
-            return False
-
-        # Case 2: shared match existed for 60s without a successful joint chat.
-        state["window_deadline"] = 0.0
-        state["cooldown_until"] = now + AUTO_RECONNECT_DELAY_EXTENDED
-        auto_rematch_state[mac_hex] = state
-        return True
-
-    return False
+    return bytes.fromhex(mac_hex) in blocked_auto_rematch_peers
 
 
 def _track_match_window(mac, peer_info):
@@ -417,56 +477,167 @@ def _save_recent_chat_peers(peers):
     except Exception as ex:
         print("WARN: cannot write {}: {}".format(RECENT_CHAT_PEERS_TOML, ex))
 
+def _peer_confidence(mac):
+    state = _get_peer_server_state(mac, create=False) or {}
+    conf = state.get("confidence")
+    if conf is None:
+        return 0.0
+    try:
+        return float(conf)
+    except Exception:
+        return 0.0
 
 
-def find_best_shared_match():
-    """Return (topic, name, rssi) for best nearby server-approved peer."""
-    best_topic = None
-    best_name = ""
-    best_rssi = -999
+def _normalize_topic_token(text):
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.strip().split())
+
+
+def _parse_topic_string_max2(raw):
+    text = _normalize_topic_token(raw)
+    if not text:
+        return []
+
+    parts = [text]
+    for delim in ("|", ",", ";"):
+        if delim in text:
+            parts = text.split(delim)
+            break
+
+    out = []
+    seen = set()
+    for part in parts:
+        topic = _normalize_topic_token(part)
+        if not topic:
+            continue
+        key = topic.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(topic)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def _peer_server_topics(mac):
+    state = _get_peer_server_state(mac, create=False) or {}
+    raw_topics = state.get("topics")
+    if isinstance(raw_topics, list):
+        parsed = []
+        seen = set()
+        for item in raw_topics:
+            topic = _normalize_topic_token(item)
+            if not topic:
+                continue
+            key = topic.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed.append(topic)
+            if len(parsed) >= 2:
+                break
+        if parsed:
+            return parsed
+
+    single = _normalize_topic_token(state.get("topic"))
+    return [single] if single else []
+
+
+def _peer_broadcast_topics(mac):
+    peer = nearby_peers.get(mac)
+    if not isinstance(peer, dict):
+        return []
+    return _parse_topic_string_max2(peer.get("topic"))
+
+
+def _resolve_topics_for_peer(mac):
+    topics = _peer_server_topics(mac)
+    if topics:
+        return topics[:2]
+    topics = _peer_broadcast_topics(mac)
+    if topics:
+        return topics[:2]
+    return ["Conversation"]
+
+
+def _resolve_search_topics_for_peer(mac):
+    topics = _peer_server_topics(mac)
+    if topics:
+        return topics[:2]
+    topics = _peer_broadcast_topics(mac)
+    if topics:
+        return topics[:2]
+    return []
+
+
+def _topics_debug_str(topics):
+    cleaned = []
+    for item in topics[:2]:
+        topic = _normalize_topic_token(item)
+        if topic:
+            cleaned.append(topic)
+    if not cleaned:
+        return "-"
+    return "|".join(cleaned)
+
+
+def _topic_source_for_peer(mac):
+    if _peer_server_topics(mac):
+        return "server"
+    if _peer_broadcast_topics(mac):
+        return "peer"
+    return "none"
+
+
+def _pick_best_server_match_peer(require_peer_targets_me=False):
+    best_mac = None
     best_conf = -1.0
+    best_mac_hex = None
+    my_mac_bytes = bytes(my_mac)
+
     for mac, peer in nearby_peers.items():
+        if mac == my_mac_bytes:
+            continue
         if _is_blocked_peer_mac(mac):
             continue
         if not _peer_is_server_match(mac):
             continue
+        if require_peer_targets_me:
+            if not peer.get("shared_flag"):
+                continue
+            if peer.get("peer_mac") != my_mac_bytes:
+                continue
 
-        state = _get_peer_server_state(mac, create=False) or {}
-        conf = state.get("confidence")
-        if conf is None:
-            conf = 0.0
-
-        topic = ""
-        if peer.get("mode") == MODE_CHAT and peer.get("topic"):
-            topic = peer.get("topic", "")
-        if not topic:
-            topic = "Conversation"
-
-        rssi = peer.get("rssi", -999)
-        if (conf > best_conf) or (conf == best_conf and rssi > best_rssi):
-            best_topic = topic
-            best_name = peer.get("name", "")
-            best_rssi = rssi
+        conf = _peer_confidence(mac)
+        mac_hex = _mac_bytes_to_hex(mac) or ""
+        if (
+            best_mac is None
+            or conf > best_conf
+            or (conf == best_conf and mac_hex < best_mac_hex)
+        ):
+            best_mac = mac
             best_conf = conf
+            best_mac_hex = mac_hex
 
-    return best_topic, best_name, best_rssi
-
-
-def has_live_shared_match():
-    topic, _, _ = find_best_shared_match()
-    return bool(topic)
+    return best_mac
 
 
-def interest_to_led_color(topic):
-    """
-    Deterministically map a shared-interest topic to a visible LED color.
-    Same topic -> same color across devices.
-    """
-    if not topic:
+def _pair_led_color(mac_a, mac_b):
+    mac_a_hex = _mac_bytes_to_hex(mac_a)
+    mac_b_hex = _mac_bytes_to_hex(mac_b)
+    if (not mac_a_hex) or (not mac_b_hex):
         return (0, 80, 80)
+
+    if mac_a_hex > mac_b_hex:
+        mac_a_hex, mac_b_hex = mac_b_hex, mac_a_hex
+
+    pair_key = "{}:{}".format(mac_a_hex, mac_b_hex)
     h = 0
-    for ch in topic.lower():
+    for ch in pair_key:
         h = ((h * 33) + ord(ch)) & 0xFFFF
+
     palette = (
         (120, 30, 30),
         (30, 120, 30),
@@ -529,6 +700,89 @@ def _topic_to_image_path(topic):
     return None
 
 
+def _topic_image_paths_or_none(topics):
+    cleaned = []
+    for topic in topics[:2]:
+        normalized = _normalize_topic_token(topic)
+        if normalized:
+            cleaned.append(normalized)
+
+    if not cleaned:
+        return None
+
+    paths = []
+    for topic in cleaned:
+        image_path = _topic_to_image_path(topic)
+        if not image_path:
+            return None
+        paths.append(image_path)
+    return paths
+
+
+def _render_topic_visual_panel(group, start_y, topics):
+    topic_list = []
+    for topic in topics[:2]:
+        normalized = _normalize_topic_token(topic)
+        if normalized:
+            topic_list.append(normalized)
+
+    image_paths = _topic_image_paths_or_none(topic_list)
+    if not image_paths:
+        return False, start_y
+
+    try:
+        if len(image_paths) >= 2:
+            bmp_left = displayio.OnDiskBitmap(image_paths[0])
+            bmp_right = displayio.OnDiskBitmap(image_paths[1])
+            half_width = 148
+            left_x = max(0, (half_width - bmp_left.width) // 2)
+            right_x = half_width + max(0, (half_width - bmp_right.width) // 2)
+            top_y = max(start_y, 30)
+            panel_height = bmp_left.height if bmp_left.height >= bmp_right.height else bmp_right.height
+            max_bottom = 102
+            if top_y + panel_height > max_bottom:
+                top_y = max(22, max_bottom - panel_height)
+
+            group.append(displayio.TileGrid(bmp_left, pixel_shader=bmp_left.pixel_shader, x=left_x, y=top_y))
+            group.append(displayio.TileGrid(bmp_right, pixel_shader=bmp_right.pixel_shader, x=right_x, y=top_y))
+            return True, top_y + panel_height
+
+        bmp = displayio.OnDiskBitmap(image_paths[0])
+        left_width = 152
+        top_y = max(start_y, 30)
+        max_bottom = 102
+        if top_y + bmp.height > max_bottom:
+            top_y = max(22, max_bottom - bmp.height)
+        image_x = max(0, (left_width - bmp.width) // 2)
+        group.append(displayio.TileGrid(bmp, pixel_shader=bmp.pixel_shader, x=image_x, y=top_y))
+
+        exact_topic = topic_list[0]
+        max_chars = 22
+        line_1 = exact_topic[:max_chars]
+        line_2 = exact_topic[max_chars : max_chars * 2] if len(exact_topic) > max_chars else ""
+        text_x = 162
+        group.append(label.Label(
+            terminalio.FONT,
+            text=line_1,
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(text_x, top_y + 8),
+            scale=1,
+        ))
+        if line_2:
+            group.append(label.Label(
+                terminalio.FONT,
+                text=line_2,
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(text_x, top_y + 20),
+                scale=1,
+            ))
+        return True, top_y + bmp.height
+    except Exception:
+        return False, start_y
+
+
 # -------------------------
 # Badge match alert
 # -------------------------
@@ -547,11 +801,7 @@ def get_match_led_color(match_pct, rssi):
 
 
 def flash_alert(color, flashes=2, on_s=0.08, off_s=0.08):
-    for _ in range(flashes):
-        pixels.fill(color)
-        time.sleep(on_s)
-        pixels.fill(0)
-        time.sleep(off_s)
+    _queue_led_effect(color, flashes=flashes, on_s=on_s, off_s=off_s)
 
 
 
@@ -581,12 +831,21 @@ def check_badge_matches(packet_mac, peer_info):
         confidence = 0.0
     match_pct = int(max(0, min(100, confidence * 100.0)))
     color = get_match_led_color(match_pct, rssi)
+    server_topics = _peer_server_topics(packet_mac)
+    peer_topics = _peer_broadcast_topics(packet_mac)
+    topic_source = _topic_source_for_peer(packet_mac)
     print(
-        "ALERT! Server match with {}: conf={}%, rssi={} dBm, color={}".format(
+        (
+            "ALERT! Server match with {}: conf={}%, rssi={} dBm, color={} "
+            "topic_src={} server_topics={} peer_topics={}"
+        ).format(
             peer_info.get("name", ""),
             match_pct,
             rssi,
             color,
+            topic_source,
+            _topics_debug_str(server_topics),
+            _topics_debug_str(peer_topics),
         )
     )
     flash_alert(color)
@@ -612,25 +871,25 @@ def do_broadcast():
     last_broadcast = time.monotonic()
 
 def flash_new_peer():
-    for _ in range(2):
-        pixels.fill((0, 80, 80))
-        time.sleep(0.08)
-        pixels.fill(0)
-        time.sleep(0.08)
+    _queue_led_effect((0, 80, 80), flashes=2, on_s=0.08, off_s=0.08)
 
-def receive_all():
+def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver
-    global search_match_latched, search_match_topic, search_match_color
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color, search_match_topics
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
     global rx_packets, parse_failures
 
     changed = False
+    processed = 0
     now = time.monotonic()
 
     while e:
+        if max_packets and processed >= max_packets:
+            break
         packet = e.read()
         if packet is None:
             break
+        processed += 1
         rx_packets += 1
 
         info = parse_message(packet.msg)
@@ -651,6 +910,7 @@ def receive_all():
             "rssi": packet.rssi,
             "last_seen": now,
             "peer_mac": info["peer_mac"],
+            "shared_flag": info["shared_flag"],
             "common_idx": info["common_idx"],
             "idx_ver": info["idx_ver"],
         }
@@ -668,7 +928,9 @@ def receive_all():
         else:
             if (old["mode"] != info["mode"] or
                 old["name"] != info["name"] or
-                old["topic"] != info["topic"]):
+                old["topic"] != info["topic"] or
+                old.get("peer_mac") != info["peer_mac"] or
+                old.get("shared_flag") != info["shared_flag"]):
                 changed = True
             # Peer timed out/exited CHAT that was targeting us:
             # mirror cooldown on this badge so SEARCH match notice clears too.
@@ -687,98 +949,49 @@ def receive_all():
         changed = True
 
     if current_mode == MODE_CHAT:
-        # Follow the strongest broadcaster in the same active topic to allow open join.
-        if (not chat_force_empty_topic) and chat_common:
-            active_topic = chat_common[chat_common_idx].lower()
-            best_mac = None
-            best_rssi = -999
-            for mac, candidate in nearby_peers.items():
-                if mac != chat_peer_mac and _is_blocked_peer_mac(mac):
-                    continue
-                if candidate.get("mode") != MODE_CHAT:
-                    continue
-                if candidate.get("topic", "").lower() != active_topic:
-                    continue
-                if candidate["rssi"] > best_rssi:
-                    best_mac = mac
-                    best_rssi = candidate["rssi"]
-            if best_mac is not None:
-                chat_peer_mac = best_mac
-
         peer = nearby_peers.get(chat_peer_mac) if chat_peer_mac else None
         if peer:
-            new_common, _ = compute_match(MY_INTERESTS, peer["interests"])
-            if (not new_common) and chat_peer_mac and _peer_is_server_match(chat_peer_mac):
-                new_common = ["Conversation"]
-            if new_common != chat_common:
-                prior_topic = chat_common[chat_common_idx] if chat_common else ""
-                chat_common = new_common
-                if not chat_common:
-                    chat_common_idx = 0
-                else:
-                    mapped_idx = index_for_topic(chat_common, prior_topic)
-                    if mapped_idx is not None:
-                        chat_common_idx = mapped_idx
-                    elif chat_common_idx >= len(chat_common):
-                        chat_common_idx = 0
-                changed = True
-
-            # Only synchronize topic index/version with peers that are also in CHAT.
-            # SEARCH peers broadcast idx=0/topic="", which must not override our chat topic.
-            if peer.get("mode") == MODE_CHAT:
+            peer_in_chat = (peer.get("mode") == MODE_CHAT)
+            if peer_in_chat:
                 if chat_peer_mac:
                     _mark_chat_handshake_success(chat_peer_mac)
-                    if chat_wait_peer_mac == chat_peer_mac:
+                    if (
+                        chat_wait_peer_mac == chat_peer_mac and
+                        peer.get("peer_mac") == bytes(my_mac)
+                    ):
                         chat_wait_deadline = 0.0
-                    if chat_peer_exit_deadline > 0.0:
+                    if chat_peer_exit_deadline > 0.0 and peer.get("peer_mac") == bytes(my_mac):
                         chat_peer_exit_deadline = 0.0
-                peer_ver = peer.get("idx_ver", 0)
-                peer_topic = peer.get("topic", "")
-                peer_topic_idx = index_for_topic(chat_common, peer_topic)
-                if peer_ver > chat_idx_ver:
-                    chat_idx_ver = peer_ver
-                    if chat_common:
-                        if peer_topic_idx is not None:
-                            chat_common_idx = peer_topic_idx
-                        else:
-                            chat_common_idx = peer.get("common_idx", 0) % len(chat_common)
-                    else:
-                        chat_common_idx = 0
-                    changed = True
-                elif peer_ver == chat_idx_ver:
-                    if bytes(my_mac) > chat_peer_mac:
-                        if chat_common:
-                            if peer_topic_idx is not None:
-                                peer_idx = peer_topic_idx
-                            else:
-                                peer_idx = peer.get("common_idx", 0) % len(chat_common)
-                        else:
-                            peer_idx = 0
-                        if peer_idx != chat_common_idx:
-                            chat_common_idx = peer_idx
-                            changed = True
 
     else:
-        # Keep SEARCH display topic and SEARCH LED color sourced from the same live match.
-        matched_topic, _, _ = find_best_shared_match()
-        if matched_topic:
-            new_color = interest_to_led_color(matched_topic)
+        best_mac = _pick_best_server_match_peer()
+        if best_mac is not None:
+            best_peer_name = nearby_peers.get(best_mac, {}).get("name", "")
+            new_color = _pair_led_color(bytes(my_mac), best_mac)
+            new_topics = _resolve_search_topics_for_peer(best_mac)
             if (not search_match_latched or
-                    matched_topic.lower() != search_match_topic.lower() or
-                    new_color != search_match_color):
+                    best_mac != search_match_peer_mac or
+                    best_peer_name != search_match_peer_name or
+                    new_color != search_match_color or
+                    new_topics != search_match_topics):
                 changed = True
-            search_match_topic = matched_topic
+            search_match_peer_mac = best_mac
+            search_match_peer_name = best_peer_name
             search_match_color = new_color
+            search_match_topics = new_topics
             search_match_latched = True
         else:
-            if search_match_latched or search_match_topic:
+            if search_match_latched or search_match_peer_mac or search_match_topics:
                 changed = True
             search_match_latched = False
-            search_match_topic = ""
+            search_match_peer_mac = None
+            search_match_peer_name = ""
             search_match_color = (0, 0, 0)
+            search_match_topics = []
 
     if changed:
         display_dirty = True
+    return processed
 
 # -------------------------
 # Pick closest peer
@@ -800,25 +1013,30 @@ def pick_closest_peer(skip_blocked=False):
 # -- LEDs --
 def update_leds(phase):
     r, g, b = MODE_COLORS[current_mode]
-    if current_mode == MODE_SEARCH:
-        if search_match_latched and search_match_topic and has_live_shared_match():
-            # Matched peer found: flash latched topic color until user enters CHAT.
-            on = ((phase // 5) % 2) == 0
-            pixels.fill(search_match_color if on else (0, 0, 0))
-        else:
-            # No active match: keep a steady search color (no flashing).
-            pixels.fill((0, 12, 0))
+    override = _led_effect_override_color(time.monotonic())
+    if override is not None:
+        pixels.fill(override)
     else:
-        # In CHAT, keep LEDs solid in the shared-interest color.
-        topic = chat_common[chat_common_idx] if chat_common else ""
-
-        if topic:
-            pixels.fill(interest_to_led_color(topic))
+        if current_mode == MODE_SEARCH:
+            if (
+                search_match_latched and
+                search_match_peer_mac is not None and
+                _peer_is_server_match(search_match_peer_mac)
+            ):
+                # Matched peer found: root-pattern flash cadence.
+                on = ((phase // 5) % 2) == 0
+                pixels.fill(search_match_color if on else (0, 0, 0))
+            else:
+                # No active match: keep a steady search color (no flashing).
+                pixels.fill((0, 12, 0))
         else:
-            idx = (phase // 5) % 4
-            pixels.fill((5, 4, 0))
-            pixels[idx] = (min(r * 3, 255), min(g * 3, 255), 0)
-            pixels[(idx + 2) % 4] = (min(r * 2, 255), min(g * 2, 255), 0)
+            if chat_peer_mac is not None and _peer_is_server_match(chat_peer_mac):
+                pixels.fill(_pair_led_color(bytes(my_mac), chat_peer_mac))
+            else:
+                idx = (phase // 5) % 4
+                pixels.fill((5, 4, 0))
+                pixels[idx] = (min(r * 3, 255), min(g * 3, 255), 0)
+                pixels[(idx + 2) % 4] = (min(r * 2, 255), min(g * 2, 255), 0)
     pixels.show()
 
 
@@ -955,17 +1173,35 @@ def render_display():
     y = 50 if current_mode == MODE_SEARCH else 42
 
     if current_mode == MODE_SEARCH:
-        if search_match_topic:
-            topic_text = _display_interest_text(search_match_topic)
+        search_images_drawn = False
+
+        if search_match_peer_name:
             g.append(label.Label(
                 terminalio.FONT,
-                text="Topic: " + topic_text[:14 if search_text_scale == 2 else 30],
+                text="Match: " + search_match_peer_name[:14 if search_text_scale == 2 else 30],
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
                 scale=search_text_scale,
             ))
             y += 18 if search_text_scale == 2 else 12
+
+        if search_match_topics:
+            topics_line = "Topic: " + " | ".join(search_match_topics)
+            g.append(label.Label(
+                terminalio.FONT,
+                text=topics_line[:30 if search_text_scale == 2 else 44],
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+            ))
+            y += 12
+
+            rendered, panel_bottom = _render_topic_visual_panel(g, y, search_match_topics)
+            if rendered:
+                search_images_drawn = True
+                y = panel_bottom + 4
 
         g.append(label.Label(
             terminalio.FONT,
@@ -979,6 +1215,12 @@ def render_display():
 
         if nearby_peers:
             max_peers = 2 if search_text_scale == 2 else 4
+            if search_images_drawn:
+                # Keep matched-topic visuals prioritized in SEARCH when space is tight.
+                row_step = 17 if search_text_scale == 2 else 11
+                content_bottom = 120
+                room_rows = max(0, (content_bottom - y) // row_step)
+                max_peers = min(max_peers, room_rows)
             for mac, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:max_peers]:
                 status = _peer_status_text(mac)
                 line = "{} {} {}".format(
@@ -1002,8 +1244,8 @@ def render_display():
             color=0x333333,
             anchor_point=(0.5, 1.0),
             anchored_position=(148, 127),
-            scale=1,
-        ))
+                scale=1,
+            ))
 
     else:
         peer_name = "(None)"
@@ -1012,7 +1254,10 @@ def render_display():
         if chat_peer_mac and chat_peer_mac in nearby_peers:
             peer_name = nearby_peers[chat_peer_mac]["name"][:16]
             peer_rssi = nearby_peers[chat_peer_mac]["rssi"]
-            peer_in_chat = (nearby_peers[chat_peer_mac].get("mode") == MODE_CHAT)
+            peer_in_chat = (
+                nearby_peers[chat_peer_mac].get("mode") == MODE_CHAT and
+                nearby_peers[chat_peer_mac].get("peer_mac") == bytes(my_mac)
+            )
 
         g.append(label.Label(
             terminalio.FONT,
@@ -1035,71 +1280,65 @@ def render_display():
             ))
             y += 12
 
-        topic = chat_common[chat_common_idx] if (chat_common and peer_in_chat) else ""
-        topic_text = _display_interest_text(topic)
+        chat_topics = chat_common[:2] if (chat_common and peer_in_chat) else []
+        topic_labels = [_display_interest_text(topic) for topic in chat_topics if _display_interest_text(topic)]
+        topic_text = " | ".join(topic_labels)
         idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common)) if chat_common else ""
-        image_path = _topic_to_image_path(topic)
         image_drawn = False
 
-        if topic_text:
-            g.append(label.Label(
-                terminalio.FONT,
-                text="Topic: " + topic_text[:20],
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=1,
-            ))
-            if idx_text:
-                g.append(label.Label(
-                    terminalio.FONT,
-                    text=idx_text,
-                    color=0x555555,
-                    anchor_point=(1.0, 0.0),
-                    anchored_position=(290, y),
-                    scale=1,
-                ))
-            y += 12
-
-        if image_path:
-            try:
-                bmp = displayio.OnDiskBitmap(image_path)
-                image_x = max(0, (296 - bmp.width) // 2)
-                # Keep image a bit higher so footer instructions stay clear.
-                image_y = max(y - 32, 32)
-                max_bottom = 90
-                if image_y + bmp.height > max_bottom:
-                    image_y = max(-8, max_bottom - bmp.height)
-                g.append(displayio.TileGrid(bmp, pixel_shader=bmp.pixel_shader, x=image_x, y=image_y))
+        if chat_topics:
+            rendered, panel_bottom = _render_topic_visual_panel(g, y, chat_topics)
+            if rendered:
                 image_drawn = True
-            except Exception:
-                image_drawn = False
+                y = panel_bottom + 4
 
         if not image_drawn:
-            if peer_in_chat:
-                fallback = "Common: " + topic_text if topic_text else "Common: (None)"
-            else:
-                fallback = "Waiting for peer chat..."
-            g.append(label.Label(
-                terminalio.FONT,
-                text=fallback[:32],
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=2,
-            ))
-            y += 22
-
-            if idx_text:
+            if topic_text:
                 g.append(label.Label(
                     terminalio.FONT,
-                    text=idx_text,
-                    color=0x555555,
+                    text="Topic: " + topic_text[:20],
+                    color=0x000000,
                     anchor_point=(0.0, 0.0),
                     anchored_position=(6, y),
                     scale=1,
                 ))
+                if idx_text:
+                    g.append(label.Label(
+                        terminalio.FONT,
+                        text=idx_text,
+                        color=0x555555,
+                        anchor_point=(1.0, 0.0),
+                        anchored_position=(290, y),
+                        scale=1,
+                    ))
                 y += 12
+
+            # Only show big fallback copy when no topic text is available.
+            if not topic_text:
+                if peer_in_chat:
+                    fallback = "Conversation"
+                else:
+                    fallback = "Waiting: peer press A"
+                g.append(label.Label(
+                    terminalio.FONT,
+                    text=fallback[:32],
+                    color=0x000000,
+                    anchor_point=(0.0, 0.0),
+                    anchored_position=(6, y),
+                    scale=2,
+                ))
+                y += 22
+
+                if idx_text:
+                    g.append(label.Label(
+                        terminalio.FONT,
+                        text=idx_text,
+                        color=0x555555,
+                        anchor_point=(0.0, 0.0),
+                        anchored_position=(6, y),
+                        scale=1,
+                    ))
+                    y += 12
 
         g.append(label.Label(
             terminalio.FONT,
@@ -1124,80 +1363,52 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, chat_force_empty_topic
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
-    global search_match_latched, search_match_topic, search_match_color, blocked_auto_rematch_peers
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color, search_match_topics
+    global blocked_auto_rematch_peers
 
     if new_mode == current_mode:
         return
 
     if new_mode == MODE_CHAT:
+        if force_closest:
+            selected_peer = pick_closest_peer(skip_blocked=False)
+        else:
+            selected_peer = _pick_best_server_match_peer(require_peer_targets_me=True)
+            if selected_peer is None:
+                selected_peer = _pick_best_server_match_peer()
+
+        if selected_peer is None:
+            return
+
         chat_wait_deadline = time.monotonic() + CHAT_HANDSHAKE_TIMEOUT
-        chat_wait_peer_mac = None
+        chat_wait_peer_mac = selected_peer
         chat_peer_exit_deadline = 0.0
-        # Preserve the currently latched SEARCH topic (if any) as preferred chat start.
-        preferred_topic = search_match_topic
-        # Clear search-match latch once user chooses to move into chat.
+
         search_match_latched = False
-        search_match_topic = ""
+        search_match_peer_mac = None
+        search_match_peer_name = ""
         search_match_color = (0, 0, 0)
+        search_match_topics = []
+
+        chat_peer_mac = selected_peer
         chat_force_empty_topic = force_empty_topic
         chat_common_idx = 0
         chat_idx_ver = 0
-        chat_common = []
-
-        if force_closest:
-            chat_peer_mac = pick_closest_peer(skip_blocked=False)
-            if chat_peer_mac and chat_peer_mac in nearby_peers:
-                chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
-                if (not chat_common) and _peer_is_server_match(chat_peer_mac):
-                    chat_common = ["Conversation"]
+        if chat_force_empty_topic:
+            chat_common = []
         else:
-            # Prefer joining an ongoing chat from server-approved peers.
-            best_mac = None
-            best_rssi = -999
-            best_topic = None
-            for mac, peer in nearby_peers.items():
-                if _is_blocked_peer_mac(mac):
-                    continue
-                if not _peer_is_server_match(mac):
-                    continue
-                topic = peer.get("topic", "")
-                if peer.get("mode") == MODE_CHAT:
-                    if peer["rssi"] > best_rssi:
-                        best_mac = mac
-                        best_rssi = peer["rssi"]
-                        best_topic = topic or "Conversation"
-
-            if best_mac is not None:
-                chat_peer_mac = best_mac
-                chat_common = [best_topic]
-            else:
-                if chat_peer_mac is None:
-                    chat_peer_mac = pick_closest_peer(skip_blocked=True)
-                if chat_peer_mac and chat_peer_mac in nearby_peers:
-                    chat_common, _ = compute_match(MY_INTERESTS, nearby_peers[chat_peer_mac]["interests"])
-                    if (not chat_common) and _peer_is_server_match(chat_peer_mac):
-                        chat_common = ["Conversation"]
-
-        # If SEARCH had a matched topic, start CHAT on that same topic when possible.
-        if chat_common and preferred_topic:
-            preferred_idx = index_for_topic(chat_common, preferred_topic)
-            if preferred_idx is not None:
-                chat_common_idx = preferred_idx
-
-        if chat_peer_mac is not None:
-            _mark_chat_attempt(chat_peer_mac)
-            chat_wait_peer_mac = chat_peer_mac
-        else:
-            # Keep the button-press timeout active even if peer selection is pending.
-            chat_wait_peer_mac = None
+            chat_common = _resolve_topics_for_peer(chat_peer_mac)
+        _mark_chat_attempt(chat_peer_mac)
     else:
         if chat_peer_mac is not None:
             _start_auto_rematch_block(chat_peer_mac, AUTO_RECONNECT_DELAY)
 
         # Fresh search session starts with no latched match color.
         search_match_latched = False
-        search_match_topic = ""
+        search_match_peer_mac = None
+        search_match_peer_name = ""
         search_match_color = (0, 0, 0)
+        search_match_topics = []
         chat_peer_mac = None
         chat_common = []
         chat_common_idx = 0
@@ -1227,6 +1438,8 @@ def _new_peer_server_state():
         "decision": None,
         "confidence": None,
         "source": None,
+        "topic": "",
+        "topics": [],
         "eligible": None,
         "reason": None,
         "next_try": 0.0,
@@ -1254,20 +1467,18 @@ def _peer_is_server_match(mac):
 def _peer_status_text(mac):
     state = _get_peer_server_state(mac, create=False)
     if not state:
-        return "PEND"
+        return "WAIT"
     decision = state.get("decision")
     if decision is True:
         conf = state.get("confidence")
         if conf is None:
-            return "MATCH"
-        return "M{}".format(int(max(0, min(99, conf * 100.0))))
+            return "YES"
+        return "{}%".format(int(max(0, min(99, conf * 100.0))))
     if decision is False:
         return "NO"
-    if state.get("source") == "proximity_gate":
-        return "GATE"
     if state.get("last_error"):
         return "ERR"
-    return "PEND"
+    return "WAIT"
 
 
 def _sync_local_gate_cache():
@@ -1279,6 +1490,23 @@ def _sync_local_gate_cache():
     for mac, _peer in nearby_peers.items():
         state = _get_peer_server_state(mac, create=True)
         state["local_gate"] = True
+
+
+def _ensure_wifi_connected():
+    try:
+        if wifi.radio.ipv4_address:
+            return True
+    except Exception:
+        pass
+
+    if (not WIFI_SSID) or (not WIFI_PASSWORD):
+        return False
+
+    try:
+        wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
+        return bool(wifi.radio.ipv4_address)
+    except Exception:
+        return False
 
 
 def _initialize_server_client(now):
@@ -1310,6 +1538,11 @@ def _initialize_server_client(now):
         server_enabled = False
         return
 
+    if not _ensure_wifi_connected():
+        print("SERVER disabled: Wi-Fi station not connected")
+        server_enabled = False
+        return
+
     try:
         server_client = server_match_client.ServerMatchClient(
             base_url=MATCH_SERVER_BASE_URL,
@@ -1318,6 +1551,7 @@ def _initialize_server_client(now):
         )
         server_enabled = True
         next_observe_sync = now
+        _sync_self_interest()
         print("SERVER enabled base_url={} device_id={}".format(MATCH_SERVER_BASE_URL, MY_DEVICE_ID))
     except Exception as ex:
         server_client = None
@@ -1333,13 +1567,35 @@ def _mark_server_error(result):
     return code
 
 
+def _sync_self_interest():
+    global self_interest_synced
+
+    if self_interest_synced or (not server_enabled) or server_auth_failed or server_client is None:
+        return
+
+    interest_blurb = (MY_INTERESTS or "").strip()
+    if not interest_blurb:
+        self_interest_synced = True
+        return
+
+    result = server_client.put_interest(MY_DEVICE_ID, interest_blurb)
+    if result.get("ok"):
+        self_interest_synced = True
+        print("SERVER self-interest synced")
+        return
+
+    code = _mark_server_error(result)
+    print("SERVER self-interest sync failed code={}".format(code or "UNKNOWN"))
+    self_interest_synced = True
+
+
 def _sync_server_observations(now):
     global next_observe_sync
 
     if not server_enabled or server_auth_failed or server_client is None:
-        return
+        return False
     if now < next_observe_sync:
-        return
+        return False
 
     observations = []
     for mac, peer in nearby_peers.items():
@@ -1361,38 +1617,77 @@ def _sync_server_observations(now):
 
     if not observations:
         next_observe_sync = now + MATCH_OBSERVE_INTERVAL_S
-        return
+        return False
 
+    started = time.monotonic()
     result = server_client.post_observe(MY_DEVICE_ID, observations)
+    _record_server_call_duration(started)
     if result.get("ok"):
         next_observe_sync = now + MATCH_OBSERVE_INTERVAL_S
-        return
+        return True
 
     code = _mark_server_error(result)
     next_observe_sync = now + MATCH_ERROR_BACKOFF_S
     print("SERVER observe failed code={}".format(code or "UNKNOWN"))
+    return True
 
 
-def _sync_server_matches(now):
+def _peer_due_for_server_match(state, peer, now):
+    next_try = float(state.get("next_try") or 0.0)
+    if now >= next_try:
+        return True
+
+    last_rssi = state.get("last_match_rssi")
+    if last_rssi is None:
+        return False
+
+    delta = abs(int(peer.get("rssi", -100)) - int(last_rssi))
+    return delta >= MATCH_RSSI_RECHECK_DELTA
+
+
+def _sync_server_matches(now, max_calls=1):
+    global match_rr_cursor
+
     if not server_enabled or server_auth_failed or server_client is None:
-        return
+        return 0
+    if max_calls <= 0:
+        return 0
 
-    for mac, peer in nearby_peers.items():
+    peer_items = list(nearby_peers.items())
+    if not peer_items:
+        match_rr_cursor = 0
+        return 0
+
+    n = len(peer_items)
+    start_idx = match_rr_cursor % n
+    checked = 0
+    calls = 0
+
+    while checked < n and calls < max_calls:
+        idx = (start_idx + checked) % n
+        mac, peer = peer_items[idx]
         state = _get_peer_server_state(mac, create=True)
-        next_try = float(state.get("next_try") or 0.0)
-        if now < next_try:
-            last_rssi = state.get("last_match_rssi")
-            if last_rssi is None:
-                continue
-            delta = abs(int(peer.get("rssi", -100)) - int(last_rssi))
-            if delta < MATCH_RSSI_RECHECK_DELTA:
-                continue
+
+        if not _peer_due_for_server_match(state, peer, now):
+            checked += 1
+            continue
 
         peer_device_id = _mac_bytes_to_hex(mac)
         if not peer_device_id:
+            checked += 1
             continue
 
-        result = server_client.post_match(MY_DEVICE_ID, peer_device_id, return_rationale=False)
+        started = time.monotonic()
+        result = server_client.post_match(
+            MY_DEVICE_ID,
+            peer_device_id,
+            return_rationale=False,
+            return_topic=True,
+        )
+        _record_server_call_duration(started)
+        calls += 1
+        match_rr_cursor = (idx + 1) % n
+
         if result.get("ok"):
             data = result.get("data")
             if not isinstance(data, dict):
@@ -1406,6 +1701,9 @@ def _sync_server_matches(now):
             state["decision"] = data.get("decision")
             state["confidence"] = data.get("confidence")
             state["source"] = data.get("source")
+            parsed_topics = _parse_topic_string_max2(data.get("topic"))
+            state["topics"] = parsed_topics
+            state["topic"] = parsed_topics[0] if parsed_topics else ""
             state["eligible"] = eligibility.get("eligible")
             state["reason"] = eligibility.get("reason")
             state["last_error"] = ""
@@ -1418,20 +1716,34 @@ def _sync_server_matches(now):
                 state["next_try"] = now + MATCH_REQUEST_INTERVAL_S
 
             if old_decision != state.get("decision"):
+                server_topics = _peer_server_topics(mac)
+                peer_topics = _peer_broadcast_topics(mac)
+                topic_source = _topic_source_for_peer(mac)
                 print(
-                    "SERVER_MATCH {} decision={} source={} conf={}".format(
+                    (
+                        "SERVER_MATCH {} decision={} source={} conf={} "
+                        "topic_src={} server_topics={} peer_topics={}"
+                    ).format(
                         _mac_bytes_to_hex(mac),
                         state.get("decision"),
                         state.get("source"),
                         state.get("confidence"),
+                        topic_source,
+                        _topics_debug_str(server_topics),
+                        _topics_debug_str(peer_topics),
                     )
                 )
-            continue
+        else:
+            code = _mark_server_error(result)
+            state["last_error"] = code or "UNKNOWN"
+            state["next_try"] = now + MATCH_ERROR_BACKOFF_S
+            print("SERVER match failed {} code={}".format(_mac_bytes_to_hex(mac), state["last_error"]))
 
-        code = _mark_server_error(result)
-        state["last_error"] = code or "UNKNOWN"
-        state["next_try"] = now + MATCH_ERROR_BACKOFF_S
-        print("SERVER match failed {} code={}".format(_mac_bytes_to_hex(mac), state["last_error"]))
+        checked += 1
+
+    if calls == 0:
+        match_rr_cursor = (start_idx + 1) % n
+    return calls
 
 
 # ===== MAIN LOOP =====
@@ -1449,48 +1761,45 @@ try:
     phase = 0
     while True:
         now = time.monotonic()
+        loop_started = now
 
-        # Buttons
-        if current_mode == MODE_SEARCH:
-            # D15 short press: enter CHAT, hold: pairing chat (no topic broadcast)
-            if not buttons[BTN_A].value:
-                if button_held(BTN_A, PAIR_HOLD_SECONDS):
-                    set_mode(MODE_CHAT, force_closest=True, force_empty_topic=True)
-                    wait_release(BTN_A)
-                else:
-                    set_mode(MODE_CHAT)
-            elif not buttons[BTN_B].value:
-                wait_release(BTN_B)
-            elif not buttons[BTN_C].value:
-                wait_release(BTN_C)
-
-        else:  # MODE_CHAT
-            # D15: back to SEARCH
-            if not buttons[BTN_A].value:
-                set_mode(MODE_SEARCH)
-                wait_release(BTN_A)
-            elif not buttons[BTN_B].value:
-                wait_release(BTN_B)
-            elif not buttons[BTN_C].value:
-                wait_release(BTN_C)
+        handled_events = _handle_button_inputs(now)
+        debug_button_events_last = handled_events
+        if handled_events > debug_button_events_max:
+            debug_button_events_max = handled_events
 
         # Periodic broadcast
         if now - last_broadcast >= BROADCAST_INTERVAL:
             do_broadcast()
 
-        # Receive
-        receive_all()
+        # Receive (bounded)
+        rx_this_tick = receive_all(RX_MAX_PACKETS_PER_TICK)
+        debug_rx_last_per_tick = rx_this_tick
+        if rx_this_tick > debug_rx_max_per_tick:
+            debug_rx_max_per_tick = rx_this_tick
+
+        # LEDs first so HTTP timing has less impact on perceived blink cadence.
+        update_leds(phase)
+        phase = (phase + 1) % 200
 
         _sync_local_gate_cache()
-        _sync_server_observations(now)
-        _sync_server_matches(now)
+        network_ops = 0
+        if network_ops < MAX_NETWORK_OPS_PER_TICK:
+            if _sync_server_observations(now):
+                network_ops += 1
+        if network_ops < MAX_NETWORK_OPS_PER_TICK:
+            network_ops += _sync_server_matches(now, max_calls=(MAX_NETWORK_OPS_PER_TICK - network_ops))
+        debug_network_ops_last = network_ops
 
         # CHAT handshake timeout:
         # if peer never enters CHAT within 10s, return to SEARCH.
         if current_mode == MODE_CHAT and chat_wait_deadline > 0.0:
             if now >= chat_wait_deadline:
                 peer = nearby_peers.get(chat_wait_peer_mac) if chat_wait_peer_mac else None
-                if (not peer) or (peer.get("mode") != MODE_CHAT):
+                if (
+                    (not peer)
+                    or (peer.get("mode") != MODE_CHAT)
+                ):
                     set_mode(MODE_SEARCH)
                     continue
                 chat_wait_deadline = 0.0
@@ -1506,8 +1815,16 @@ try:
                 channel_text = str(wifi.radio.ap_info.channel)
             except Exception:
                 pass
+            loop_elapsed_ms = (time.monotonic() - loop_started) * 1000.0
+            if loop_elapsed_ms > debug_loop_max_ms:
+                debug_loop_max_ms = loop_elapsed_ms
             print(
-                "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={} blocked_active={} srv_en={} auth_fail={}".format(
+                (
+                    "DBG mode={} ch={} tx={} err={} rx={} parse_fail={} nearby={} "
+                    "blocked_active={} srv_en={} auth_fail={} btn_evt={} btn_evt_max={} "
+                    "rx_tick={} rx_tick_max={} net_ops={} srv_ms_last={:.1f} "
+                    "srv_ms_max={:.1f} loop_ms_max={:.1f}"
+                ).format(
                     MODE_NAMES[current_mode],
                     channel_text,
                     tx_attempts,
@@ -1518,6 +1835,14 @@ try:
                     len(auto_rematch_state),
                     int(server_enabled),
                     int(server_auth_failed),
+                    debug_button_events_last,
+                    debug_button_events_max,
+                    debug_rx_last_per_tick,
+                    debug_rx_max_per_tick,
+                    debug_network_ops_last,
+                    debug_server_call_last_ms,
+                    debug_server_call_max_ms,
+                    debug_loop_max_ms,
                 )
             )
             last_debug_log = now
@@ -1526,11 +1851,10 @@ try:
         if display_dirty and (now - last_display_refresh >= DISPLAY_REFRESH):
             render_display()
 
-        # LEDs
-        update_leds(phase)
-        phase = (phase + 1) % 200
-
-        time.sleep(0.08)
+        loop_elapsed_ms = (time.monotonic() - loop_started) * 1000.0
+        if loop_elapsed_ms > debug_loop_max_ms:
+            debug_loop_max_ms = loop_elapsed_ms
+        time.sleep(LOOP_SLEEP_S)
 
 except Exception as ex:
     # Blink NeoPixels red

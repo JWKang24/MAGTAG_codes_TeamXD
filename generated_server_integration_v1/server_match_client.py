@@ -109,10 +109,11 @@ class ServerMatchClient:
         }
         return self._request("POST", "/v1/proximity/observe", payload)
 
-    def post_match(self, device_id_a, device_id_b, return_rationale=False):
+    def post_match(self, device_id_a, device_id_b, return_rationale=False, return_topic=True):
         payload = {
             "device_id_a": device_id_a,
             "device_id_b": device_id_b,
             "return_rationale": bool(return_rationale),
+            "return_topic": bool(return_topic),
         }
         return self._request("POST", "/v1/match", payload)
