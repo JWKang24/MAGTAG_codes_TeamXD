@@ -7,6 +7,7 @@ import neopixel
 import keypad
 import espnow
 import wifi
+import adafruit_imageload
 from adafruit_display_text import label
 import server_match_client
 
@@ -176,6 +177,7 @@ search_match_peer_mac = None
 search_match_peer_name = ""
 search_match_color = (0, 0, 0)
 search_match_topics = []
+search_match_icon_filename = ""
 
 # -- Badge match alert state --
 RSSI_BADGE_THRESHOLD = -65
@@ -494,10 +496,16 @@ def _normalize_topic_token(text):
     return " ".join(text.strip().split())
 
 
-def _parse_topic_string_max2(raw):
+def _normalize_icon_filename(text):
+    if not isinstance(text, str):
+        return ""
+    return text.strip()
+
+
+def _parse_first_topic(raw):
     text = _normalize_topic_token(raw)
     if not text:
-        return []
+        return ""
 
     parts = [text]
     for delim in ("|", ",", ";"):
@@ -505,82 +513,67 @@ def _parse_topic_string_max2(raw):
             parts = text.split(delim)
             break
 
-    out = []
-    seen = set()
     for part in parts:
         topic = _normalize_topic_token(part)
         if not topic:
             continue
-        key = topic.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(topic)
-        if len(out) >= 2:
-            break
-    return out
+        return topic
+    return ""
+
+
+def _topic_list_from_raw(raw):
+    topic = _parse_first_topic(raw)
+    return [topic] if topic else []
 
 
 def _peer_server_topics(mac):
     state = _get_peer_server_state(mac, create=False) or {}
+    single = _normalize_topic_token(state.get("topic"))
+    if single:
+        return [single]
+
     raw_topics = state.get("topics")
     if isinstance(raw_topics, list):
-        parsed = []
-        seen = set()
         for item in raw_topics:
             topic = _normalize_topic_token(item)
-            if not topic:
-                continue
-            key = topic.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            parsed.append(topic)
-            if len(parsed) >= 2:
-                break
-        if parsed:
-            return parsed
-
-    single = _normalize_topic_token(state.get("topic"))
-    return [single] if single else []
+            if topic:
+                return [topic]
+    return []
 
 
 def _peer_broadcast_topics(mac):
     peer = nearby_peers.get(mac)
     if not isinstance(peer, dict):
         return []
-    return _parse_topic_string_max2(peer.get("topic"))
+    return _topic_list_from_raw(peer.get("topic"))
 
 
 def _resolve_topics_for_peer(mac):
     topics = _peer_server_topics(mac)
     if topics:
-        return topics[:2]
+        return topics[:1]
     topics = _peer_broadcast_topics(mac)
     if topics:
-        return topics[:2]
+        return topics[:1]
     return ["Conversation"]
 
 
 def _resolve_search_topics_for_peer(mac):
     topics = _peer_server_topics(mac)
     if topics:
-        return topics[:2]
+        return topics[:1]
     topics = _peer_broadcast_topics(mac)
     if topics:
-        return topics[:2]
+        return topics[:1]
     return []
 
 
 def _topics_debug_str(topics):
-    cleaned = []
-    for item in topics[:2]:
+    for item in topics[:1]:
         topic = _normalize_topic_token(item)
         if topic:
-            cleaned.append(topic)
-    if not cleaned:
-        return "-"
-    return "|".join(cleaned)
+            return topic
+    return "-"
 
 
 def _topic_source_for_peer(mac):
@@ -700,87 +693,171 @@ def _topic_to_image_path(topic):
     return None
 
 
-def _topic_image_paths_or_none(topics):
-    cleaned = []
-    for topic in topics[:2]:
-        normalized = _normalize_topic_token(topic)
-        if normalized:
-            cleaned.append(normalized)
-
-    if not cleaned:
+def _server_icon_to_image_path(icon_filename):
+    if not isinstance(icon_filename, str):
+        return None
+    name = icon_filename.strip()
+    if not name:
+        return None
+    if "/" in name or "\\" in name:
+        return None
+    path = "/images/{}".format(name)
+    try:
+        os.stat(path)
+        return path
+    except OSError:
         return None
 
-    paths = []
-    for topic in cleaned:
-        image_path = _topic_to_image_path(topic)
-        if not image_path:
-            return None
-        paths.append(image_path)
-    return paths
+
+def _resolve_topic_image_path(topic, icon_filename):
+    from_server = _server_icon_to_image_path(icon_filename)
+    if from_server:
+        return from_server
+    return _topic_to_image_path(topic)
 
 
-def _render_topic_visual_panel(group, start_y, topics):
-    topic_list = []
-    for topic in topics[:2]:
-        normalized = _normalize_topic_token(topic)
+def _wrap_text_for_panel(text, max_chars=11, max_lines=3):
+    raw = _normalize_topic_token(text)
+    if not raw:
+        return ""
+
+    words = raw.split(" ")
+    if not words:
+        return ""
+
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) <= max_chars:
+            current += " " + word
+        else:
+            lines.append(current)
+            if len(lines) >= max_lines:
+                break
+            current = word
+    if len(lines) < max_lines:
+        lines.append(current)
+
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    return "\n".join(lines)
+
+
+def _topic_sentence_chat(topic):
+    clean = _normalize_topic_token(topic)
+    if not clean:
+        return ""
+    return "You are both interested in {}".format(clean)
+
+
+def _fit_bitmap_to_box(bitmap, palette, max_width, max_height):
+    if (
+        bitmap.width <= max_width
+        and bitmap.height <= max_height
+    ):
+        return bitmap, palette
+
+    factor = 1
+    while (
+        ((bitmap.width + factor - 1) // factor) > max_width
+        or ((bitmap.height + factor - 1) // factor) > max_height
+    ):
+        factor += 1
+
+    new_w = max(1, bitmap.width // factor)
+    new_h = max(1, bitmap.height // factor)
+    color_count = 2
+    try:
+        color_count = len(palette)
+    except Exception:
+        color_count = 2
+    if color_count < 2:
+        color_count = 2
+
+    resized = displayio.Bitmap(new_w, new_h, color_count)
+    for y in range(new_h):
+        src_y = y * factor
+        if src_y >= bitmap.height:
+            src_y = bitmap.height - 1
+        for x in range(new_w):
+            src_x = x * factor
+            if src_x >= bitmap.width:
+                src_x = bitmap.width - 1
+            resized[x, y] = bitmap[src_x, src_y]
+    return resized, palette
+
+
+def _render_topic_visual_panel(
+    group,
+    start_y,
+    topics,
+    icon_filename=None,
+    sentence_mode=False,
+    max_bottom=112,
+    text_scale=2,
+):
+    topic = ""
+    for item in topics[:1]:
+        normalized = _normalize_topic_token(item)
         if normalized:
-            topic_list.append(normalized)
+            topic = normalized
+            break
 
-    image_paths = _topic_image_paths_or_none(topic_list)
-    if not image_paths:
-        return False, start_y
+    if not topic:
+        return False, start_y, None
+
+    image_path = _resolve_topic_image_path(topic, icon_filename)
+    if not image_path:
+        return False, start_y, None
 
     try:
-        if len(image_paths) >= 2:
-            bmp_left = displayio.OnDiskBitmap(image_paths[0])
-            bmp_right = displayio.OnDiskBitmap(image_paths[1])
-            half_width = 148
-            left_x = max(0, (half_width - bmp_left.width) // 2)
-            right_x = half_width + max(0, (half_width - bmp_right.width) // 2)
-            top_y = max(start_y, 30)
-            panel_height = bmp_left.height if bmp_left.height >= bmp_right.height else bmp_right.height
-            max_bottom = 102
-            if top_y + panel_height > max_bottom:
-                top_y = max(22, max_bottom - panel_height)
+        bitmap, palette = adafruit_imageload.load(
+            image_path,
+            bitmap=displayio.Bitmap,
+            palette=displayio.Palette,
+        )
 
-            group.append(displayio.TileGrid(bmp_left, pixel_shader=bmp_left.pixel_shader, x=left_x, y=top_y))
-            group.append(displayio.TileGrid(bmp_right, pixel_shader=bmp_right.pixel_shader, x=right_x, y=top_y))
-            return True, top_y + panel_height
-
-        bmp = displayio.OnDiskBitmap(image_paths[0])
-        left_width = 152
+        left_panel_width = 296 // 2
+        right_panel_x = left_panel_width + 12
         top_y = max(start_y, 30)
-        max_bottom = 102
-        if top_y + bmp.height > max_bottom:
-            top_y = max(22, max_bottom - bmp.height)
-        image_x = max(0, (left_width - bmp.width) // 2)
-        group.append(displayio.TileGrid(bmp, pixel_shader=bmp.pixel_shader, x=image_x, y=top_y))
+        max_image_width = left_panel_width - 8
+        max_image_height = max(16, max_bottom - top_y)
+        bitmap, palette = _fit_bitmap_to_box(
+            bitmap,
+            palette,
+            max_image_width,
+            max_image_height,
+        )
+        if top_y + bitmap.height > max_bottom:
+            top_y = max(22, max_bottom - bitmap.height)
 
-        exact_topic = topic_list[0]
-        max_chars = 22
-        line_1 = exact_topic[:max_chars]
-        line_2 = exact_topic[max_chars : max_chars * 2] if len(exact_topic) > max_chars else ""
-        text_x = 162
+        image_x = max(0, (left_panel_width - bitmap.width) // 2)
+        group.append(displayio.TileGrid(bitmap, pixel_shader=palette, x=image_x, y=top_y))
+
+        caption = _topic_sentence_chat(topic) if sentence_mode else topic
+        wrap_chars = 11 if text_scale >= 2 else 18
+        wrapped = _wrap_text_for_panel(caption, max_chars=wrap_chars, max_lines=3)
+        line_count = 1
+        if wrapped:
+            line_count = wrapped.count("\n") + 1
         group.append(label.Label(
             terminalio.FONT,
-            text=line_1,
+            text=wrapped,
             color=0x000000,
             anchor_point=(0.0, 0.0),
-            anchored_position=(text_x, top_y + 8),
-            scale=1,
+            anchored_position=(right_panel_x, top_y + 2),
+            scale=text_scale,
+            line_spacing=1.1,
         ))
-        if line_2:
-            group.append(label.Label(
-                terminalio.FONT,
-                text=line_2,
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(text_x, top_y + 20),
-                scale=1,
-            ))
-        return True, top_y + bmp.height
+        text_bottom = top_y + 2 + (line_count * 10 * text_scale)
+        panel_bottom = top_y + bitmap.height
+        if text_bottom > panel_bottom:
+            panel_bottom = text_bottom
+        if panel_bottom > max_bottom:
+            panel_bottom = max_bottom
+        return True, panel_bottom, image_path
     except Exception:
-        return False, start_y
+        return False, start_y, None
 
 
 # -------------------------
@@ -834,16 +911,23 @@ def check_badge_matches(packet_mac, peer_info):
     server_topics = _peer_server_topics(packet_mac)
     peer_topics = _peer_broadcast_topics(packet_mac)
     topic_source = _topic_source_for_peer(packet_mac)
+    chosen_topic = server_topics[0] if server_topics else (peer_topics[0] if peer_topics else "")
+    icon_filename = state.get("icon_filename")
+    resolved_image = _resolve_topic_image_path(chosen_topic, icon_filename) if chosen_topic else None
     print(
         (
             "ALERT! Server match with {}: conf={}%, rssi={} dBm, color={} "
-            "topic_src={} server_topics={} peer_topics={}"
+            "topic_src={} topic={} server_icon={} image={} "
+            "server_topics={} peer_topics={}"
         ).format(
             peer_info.get("name", ""),
             match_pct,
             rssi,
             color,
             topic_source,
+            chosen_topic or "-",
+            icon_filename or "-",
+            resolved_image or "-",
             _topics_debug_str(server_topics),
             _topics_debug_str(peer_topics),
         )
@@ -875,7 +959,8 @@ def flash_new_peer():
 
 def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
     global display_dirty, chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver
-    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color, search_match_topics
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
+    global search_match_topics, search_match_icon_filename
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
     global rx_packets, parse_failures
 
@@ -969,25 +1054,30 @@ def receive_all(max_packets=RX_MAX_PACKETS_PER_TICK):
             best_peer_name = nearby_peers.get(best_mac, {}).get("name", "")
             new_color = _pair_led_color(bytes(my_mac), best_mac)
             new_topics = _resolve_search_topics_for_peer(best_mac)
+            best_state = _get_peer_server_state(best_mac, create=False) or {}
+            new_icon_filename = _normalize_icon_filename(best_state.get("icon_filename"))
             if (not search_match_latched or
                     best_mac != search_match_peer_mac or
                     best_peer_name != search_match_peer_name or
                     new_color != search_match_color or
-                    new_topics != search_match_topics):
+                    new_topics != search_match_topics or
+                    new_icon_filename != search_match_icon_filename):
                 changed = True
             search_match_peer_mac = best_mac
             search_match_peer_name = best_peer_name
             search_match_color = new_color
             search_match_topics = new_topics
+            search_match_icon_filename = new_icon_filename
             search_match_latched = True
         else:
-            if search_match_latched or search_match_peer_mac or search_match_topics:
+            if search_match_latched or search_match_peer_mac or search_match_topics or search_match_icon_filename:
                 changed = True
             search_match_latched = False
             search_match_peer_mac = None
             search_match_peer_name = ""
             search_match_color = (0, 0, 0)
             search_match_topics = []
+            search_match_icon_filename = ""
 
     if changed:
         display_dirty = True
@@ -1159,26 +1249,73 @@ def render_display():
     ))
 
     search_text_scale = 2 if current_mode == MODE_SEARCH else 1
+    search_match_active = (
+        current_mode == MODE_SEARCH
+        and search_match_latched
+        and search_match_peer_mac is not None
+        and _peer_is_server_match(search_match_peer_mac)
+    )
+    show_status_line = (current_mode == MODE_SEARCH) and (not search_match_active)
 
-    # status line
-    g.append(label.Label(
-        terminalio.FONT,
-        text=MODE_DESCRIPTIONS[current_mode],
-        color=0x000000,
-        anchor_point=(0.0, 0.0),
-        anchored_position=(6, 28 if current_mode == MODE_SEARCH else 30),
-        scale=search_text_scale,
-    ))
+    if show_status_line:
+        g.append(label.Label(
+            terminalio.FONT,
+            text=MODE_DESCRIPTIONS[MODE_SEARCH],
+            color=0x000000,
+            anchor_point=(0.0, 0.0),
+            anchored_position=(6, 28),
+            scale=search_text_scale,
+        ))
 
-    y = 50 if current_mode == MODE_SEARCH else 42
+    y = 50 if (current_mode == MODE_SEARCH and show_status_line) else 32 if current_mode == MODE_SEARCH else 30
+    content_bottom = 112
 
     if current_mode == MODE_SEARCH:
-        search_images_drawn = False
+        search_match_label_scale = 1 if search_text_scale > 1 else search_text_scale
 
         if search_match_peer_name:
             g.append(label.Label(
                 terminalio.FONT,
-                text="Match: " + search_match_peer_name[:14 if search_text_scale == 2 else 30],
+                text="Match: " + search_match_peer_name[:24],
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=search_match_label_scale,
+            ))
+            y += 12 if search_match_label_scale == 1 else 18
+
+        if search_match_topics:
+            rendered, panel_bottom, _ = _render_topic_visual_panel(
+                g,
+                y,
+                search_match_topics,
+                search_match_icon_filename,
+                sentence_mode=False,
+                max_bottom=116,
+                text_scale=2,
+            )
+            if rendered:
+                y = panel_bottom + 4
+            else:
+                topic_text = _display_interest_text(search_match_topics[0])
+                if topic_text:
+                    wrapped_topic = _wrap_text_for_panel(topic_text, max_chars=22, max_lines=2)
+                    topic_line_count = wrapped_topic.count("\n") + 1 if wrapped_topic else 0
+                    g.append(label.Label(
+                        terminalio.FONT,
+                        text=wrapped_topic[:64],
+                        color=0x000000,
+                        anchor_point=(0.0, 0.0),
+                        anchored_position=(6, y),
+                        scale=2,
+                        line_spacing=1.1,
+                    ))
+                    y += max(18, topic_line_count * 18)
+
+        if y <= (content_bottom - (18 if search_text_scale == 2 else 12)):
+            g.append(label.Label(
+                terminalio.FONT,
+                text="Nearby: " + str(len(nearby_peers)),
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
@@ -1186,41 +1323,11 @@ def render_display():
             ))
             y += 18 if search_text_scale == 2 else 12
 
-        if search_match_topics:
-            topics_line = "Topic: " + " | ".join(search_match_topics)
-            g.append(label.Label(
-                terminalio.FONT,
-                text=topics_line[:30 if search_text_scale == 2 else 44],
-                color=0x000000,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=1,
-            ))
-            y += 12
-
-            rendered, panel_bottom = _render_topic_visual_panel(g, y, search_match_topics)
-            if rendered:
-                search_images_drawn = True
-                y = panel_bottom + 4
-
-        g.append(label.Label(
-            terminalio.FONT,
-            text="Nearby: " + str(len(nearby_peers)),
-            color=0x000000,
-            anchor_point=(0.0, 0.0),
-            anchored_position=(6, y),
-            scale=search_text_scale,
-        ))
-        y += 18 if search_text_scale == 2 else 12
-
         if nearby_peers:
             max_peers = 2 if search_text_scale == 2 else 4
-            if search_images_drawn:
-                # Keep matched-topic visuals prioritized in SEARCH when space is tight.
-                row_step = 17 if search_text_scale == 2 else 11
-                content_bottom = 120
-                room_rows = max(0, (content_bottom - y) // row_step)
-                max_peers = min(max_peers, room_rows)
+            row_step = 17 if search_text_scale == 2 else 11
+            room_rows = max(0, (content_bottom - y) // row_step)
+            max_peers = min(max_peers, room_rows)
             for mac, peer in sorted(nearby_peers.items(), key=lambda x: x[1]["rssi"], reverse=True)[:max_peers]:
                 status = _peer_status_text(mac)
                 line = "{} {} {}".format(
@@ -1249,11 +1356,9 @@ def render_display():
 
     else:
         peer_name = "(None)"
-        peer_rssi = None
         peer_in_chat = False
         if chat_peer_mac and chat_peer_mac in nearby_peers:
             peer_name = nearby_peers[chat_peer_mac]["name"][:16]
-            peer_rssi = nearby_peers[chat_peer_mac]["rssi"]
             peer_in_chat = (
                 nearby_peers[chat_peer_mac].get("mode") == MODE_CHAT and
                 nearby_peers[chat_peer_mac].get("peer_mac") == bytes(my_mac)
@@ -1261,7 +1366,7 @@ def render_display():
 
         g.append(label.Label(
             terminalio.FONT,
-            text="With: " + peer_name,
+            text=("Chatting With: " + peer_name)[:40],
             color=0x000000,
             anchor_point=(0.0, 0.0),
             anchored_position=(6, y),
@@ -1269,76 +1374,63 @@ def render_display():
         ))
         y += 12
 
-        if peer_rssi is not None:
-            g.append(label.Label(
-                terminalio.FONT,
-                text="Signal: " + rssi_bar(peer_rssi),
-                color=0x555555,
-                anchor_point=(0.0, 0.0),
-                anchored_position=(6, y),
-                scale=1,
-            ))
-            y += 12
-
-        chat_topics = chat_common[:2] if (chat_common and peer_in_chat) else []
-        topic_labels = [_display_interest_text(topic) for topic in chat_topics if _display_interest_text(topic)]
-        topic_text = " | ".join(topic_labels)
+        chat_topics = chat_common[:1] if (chat_common and peer_in_chat) else []
+        topic_text = _display_interest_text(chat_topics[0]) if chat_topics else ""
         idx_text = "({}/{})".format(chat_common_idx + 1, len(chat_common)) if chat_common else ""
         image_drawn = False
+        chat_icon_filename = ""
+        if chat_peer_mac is not None:
+            chat_state = _get_peer_server_state(chat_peer_mac, create=False) or {}
+            chat_icon_filename = chat_state.get("icon_filename") or ""
 
         if chat_topics:
-            rendered, panel_bottom = _render_topic_visual_panel(g, y, chat_topics)
+            rendered, panel_bottom, _ = _render_topic_visual_panel(
+                g,
+                y,
+                chat_topics,
+                chat_icon_filename,
+                sentence_mode=True,
+                max_bottom=116,
+                text_scale=1,
+            )
             if rendered:
                 image_drawn = True
                 y = panel_bottom + 4
 
         if not image_drawn:
             if topic_text:
+                fallback = _topic_sentence_chat(topic_text)
+            elif peer_in_chat:
+                fallback = "Conversation"
+            else:
+                fallback = "Waiting: peer press A"
+
+            max_lines = 2
+            if y > 92:
+                max_lines = 1
+            wrapped_fallback = _wrap_text_for_panel(fallback, max_chars=22, max_lines=max_lines)
+            fallback_line_count = wrapped_fallback.count("\n") + 1 if wrapped_fallback else 0
+            g.append(label.Label(
+                terminalio.FONT,
+                text=wrapped_fallback[:64],
+                color=0x000000,
+                anchor_point=(0.0, 0.0),
+                anchored_position=(6, y),
+                scale=1,
+                line_spacing=1.1,
+            ))
+            y += max(10, fallback_line_count * 10)
+
+            if idx_text and y <= (content_bottom - 10):
                 g.append(label.Label(
                     terminalio.FONT,
-                    text="Topic: " + topic_text[:20],
-                    color=0x000000,
+                    text=idx_text,
+                    color=0x555555,
                     anchor_point=(0.0, 0.0),
                     anchored_position=(6, y),
                     scale=1,
                 ))
-                if idx_text:
-                    g.append(label.Label(
-                        terminalio.FONT,
-                        text=idx_text,
-                        color=0x555555,
-                        anchor_point=(1.0, 0.0),
-                        anchored_position=(290, y),
-                        scale=1,
-                    ))
                 y += 12
-
-            # Only show big fallback copy when no topic text is available.
-            if not topic_text:
-                if peer_in_chat:
-                    fallback = "Conversation"
-                else:
-                    fallback = "Waiting: peer press A"
-                g.append(label.Label(
-                    terminalio.FONT,
-                    text=fallback[:32],
-                    color=0x000000,
-                    anchor_point=(0.0, 0.0),
-                    anchored_position=(6, y),
-                    scale=2,
-                ))
-                y += 22
-
-                if idx_text:
-                    g.append(label.Label(
-                        terminalio.FONT,
-                        text=idx_text,
-                        color=0x555555,
-                        anchor_point=(0.0, 0.0),
-                        anchored_position=(6, y),
-                        scale=1,
-                    ))
-                    y += 12
 
         g.append(label.Label(
             terminalio.FONT,
@@ -1363,7 +1455,8 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
     global current_mode, display_dirty
     global chat_peer_mac, chat_common, chat_common_idx, chat_idx_ver, chat_force_empty_topic
     global chat_wait_peer_mac, chat_wait_deadline, chat_peer_exit_deadline
-    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color, search_match_topics
+    global search_match_latched, search_match_peer_mac, search_match_peer_name, search_match_color
+    global search_match_topics, search_match_icon_filename
     global blocked_auto_rematch_peers
 
     if new_mode == current_mode:
@@ -1389,6 +1482,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         search_match_peer_name = ""
         search_match_color = (0, 0, 0)
         search_match_topics = []
+        search_match_icon_filename = ""
 
         chat_peer_mac = selected_peer
         chat_force_empty_topic = force_empty_topic
@@ -1409,6 +1503,7 @@ def set_mode(new_mode, force_closest=False, force_empty_topic=False):
         search_match_peer_name = ""
         search_match_color = (0, 0, 0)
         search_match_topics = []
+        search_match_icon_filename = ""
         chat_peer_mac = None
         chat_common = []
         chat_common_idx = 0
@@ -1440,6 +1535,7 @@ def _new_peer_server_state():
         "source": None,
         "topic": "",
         "topics": [],
+        "icon_filename": "",
         "eligible": None,
         "reason": None,
         "next_try": 0.0,
@@ -1681,8 +1777,6 @@ def _sync_server_matches(now, max_calls=1):
         result = server_client.post_match(
             MY_DEVICE_ID,
             peer_device_id,
-            return_rationale=False,
-            return_topic=True,
         )
         _record_server_call_duration(started)
         calls += 1
@@ -1701,9 +1795,10 @@ def _sync_server_matches(now, max_calls=1):
             state["decision"] = data.get("decision")
             state["confidence"] = data.get("confidence")
             state["source"] = data.get("source")
-            parsed_topics = _parse_topic_string_max2(data.get("topic"))
+            parsed_topics = _topic_list_from_raw(data.get("topic"))
             state["topics"] = parsed_topics
             state["topic"] = parsed_topics[0] if parsed_topics else ""
+            state["icon_filename"] = _normalize_icon_filename(data.get("icon_filename"))
             state["eligible"] = eligibility.get("eligible")
             state["reason"] = eligibility.get("reason")
             state["last_error"] = ""
@@ -1719,16 +1814,23 @@ def _sync_server_matches(now, max_calls=1):
                 server_topics = _peer_server_topics(mac)
                 peer_topics = _peer_broadcast_topics(mac)
                 topic_source = _topic_source_for_peer(mac)
+                chosen_topic = server_topics[0] if server_topics else (peer_topics[0] if peer_topics else "")
+                icon_filename = state.get("icon_filename")
+                resolved_image = _resolve_topic_image_path(chosen_topic, icon_filename) if chosen_topic else None
                 print(
                     (
                         "SERVER_MATCH {} decision={} source={} conf={} "
-                        "topic_src={} server_topics={} peer_topics={}"
+                        "topic_src={} topic={} server_icon={} image={} "
+                        "server_topics={} peer_topics={}"
                     ).format(
                         _mac_bytes_to_hex(mac),
                         state.get("decision"),
                         state.get("source"),
                         state.get("confidence"),
                         topic_source,
+                        chosen_topic or "-",
+                        icon_filename or "-",
+                        resolved_image or "-",
                         _topics_debug_str(server_topics),
                         _topics_debug_str(peer_topics),
                     )
