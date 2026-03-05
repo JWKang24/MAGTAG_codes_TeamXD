@@ -1299,7 +1299,7 @@ def render_display():
             else:
                 topic_text = _display_interest_text(search_match_topics[0])
                 if topic_text:
-                    wrapped_topic = _wrap_text_for_panel(topic_text, max_chars=22, max_lines=2)
+                    wrapped_topic = _wrap_text_for_panel(topic_text, max_chars=14, max_lines=2)
                     topic_line_count = wrapped_topic.count("\n") + 1 if wrapped_topic else 0
                     g.append(label.Label(
                         terminalio.FONT,
@@ -1307,10 +1307,10 @@ def render_display():
                         color=0x000000,
                         anchor_point=(0.0, 0.0),
                         anchored_position=(6, y),
-                        scale=2,
+                        scale=3,
                         line_spacing=1.1,
                     ))
-                    y += max(18, topic_line_count * 18)
+                    y += max(27, topic_line_count * 27)
 
         if y <= (content_bottom - (18 if search_text_scale == 2 else 12)):
             g.append(label.Label(
@@ -1405,10 +1405,12 @@ def render_display():
             else:
                 fallback = "Waiting: peer press A"
 
-            max_lines = 2
-            if y > 92:
+            max_lines = 3
+            if y > 90:
+                max_lines = 2
+            if y > 104:
                 max_lines = 1
-            wrapped_fallback = _wrap_text_for_panel(fallback, max_chars=22, max_lines=max_lines)
+            wrapped_fallback = _wrap_text_for_panel(fallback, max_chars=18, max_lines=max_lines)
             fallback_line_count = wrapped_fallback.count("\n") + 1 if wrapped_fallback else 0
             g.append(label.Label(
                 terminalio.FONT,
@@ -1416,10 +1418,10 @@ def render_display():
                 color=0x000000,
                 anchor_point=(0.0, 0.0),
                 anchored_position=(6, y),
-                scale=1,
+                scale=2,
                 line_spacing=1.1,
             ))
-            y += max(10, fallback_line_count * 10)
+            y += max(18, fallback_line_count * 18)
 
             if idx_text and y <= (content_bottom - 10):
                 g.append(label.Label(
@@ -1560,6 +1562,19 @@ def _peer_is_server_match(mac):
     return bool(state.get("decision") is True)
 
 
+def _is_transient_server_error(code):
+    c = str(code or "").upper()
+    if not c:
+        return True
+    if c == "NETWORK_ERROR":
+        return True
+    if c.startswith("HTTP_5"):
+        return True
+    if c in ("HTTP_429", "LLM_UPSTREAM_ERROR", "LLM_UPSTREAM_TIMEOUT", "LLM_RESPONSE_INVALID", "LLM_RATE_LIMIT"):
+        return True
+    return False
+
+
 def _peer_status_text(mac):
     state = _get_peer_server_state(mac, create=False)
     if not state:
@@ -1572,7 +1587,8 @@ def _peer_status_text(mac):
         return "{}%".format(int(max(0, min(99, conf * 100.0))))
     if decision is False:
         return "NO"
-    if state.get("last_error"):
+    err_code = str(state.get("last_error") or "")
+    if err_code and (not _is_transient_server_error(err_code)):
         return "ERR"
     return "WAIT"
 
@@ -1792,13 +1808,18 @@ def _sync_server_matches(now, max_calls=1):
                 eligibility = {}
 
             old_decision = state.get("decision")
-            state["decision"] = data.get("decision")
-            state["confidence"] = data.get("confidence")
-            state["source"] = data.get("source")
-            parsed_topics = _topic_list_from_raw(data.get("topic"))
-            state["topics"] = parsed_topics
-            state["topic"] = parsed_topics[0] if parsed_topics else ""
-            state["icon_filename"] = _normalize_icon_filename(data.get("icon_filename"))
+            incoming_decision = data.get("decision")
+            if incoming_decision is None and old_decision is False:
+                # Keep a confirmed NO sticky even when later requests are temporarily gated.
+                state["decision"] = False
+            else:
+                state["decision"] = incoming_decision
+                state["confidence"] = data.get("confidence")
+                state["source"] = data.get("source")
+                parsed_topics = _topic_list_from_raw(data.get("topic"))
+                state["topics"] = parsed_topics
+                state["topic"] = parsed_topics[0] if parsed_topics else ""
+                state["icon_filename"] = _normalize_icon_filename(data.get("icon_filename"))
             state["eligible"] = eligibility.get("eligible")
             state["reason"] = eligibility.get("reason")
             state["last_error"] = ""
@@ -1837,9 +1858,12 @@ def _sync_server_matches(now, max_calls=1):
                 )
         else:
             code = _mark_server_error(result)
-            state["last_error"] = code or "UNKNOWN"
+            if _is_transient_server_error(code):
+                state["last_error"] = ""
+            else:
+                state["last_error"] = code or "UNKNOWN"
             state["next_try"] = now + MATCH_ERROR_BACKOFF_S
-            print("SERVER match failed {} code={}".format(_mac_bytes_to_hex(mac), state["last_error"]))
+            print("SERVER match failed {} code={}".format(_mac_bytes_to_hex(mac), code or "UNKNOWN"))
 
         checked += 1
 
